@@ -1,0 +1,207 @@
+@import url('https://fonts.googleapis.com/css2?family=Mukta:wght@400;500;600;700;800&family=Rajdhani:wght@500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --color-brand-50: #fff7ed;
+  --color-brand-100: #ffedd5;
+  --color-brand-200: #fed7aa;
+  --color-brand-300: #fdba74;
+  --color-brand-400: #fb923c;
+  --color-brand-500: #ED801B;
+  --color-brand-600: #d97706;
+  --color-brand-700: #c2410c;
+  --color-brand-800: #9a3412;
+  --color-brand-900: #7c2d12;
+  --color-primary-50: #fff7ed;
+  --color-primary-100: #ffedd5;
+  --color-primary-200: #fed7aa;
+  --color-primary-300: #fdba74;
+  --color-primary-400: #fb923c;
+  --color-primary-500: #ED801B;
+  --color-primary-600: #d97706;
+  --color-primary-700: #c2410c;
+  --color-primary-800: #9a3412;
+  --color-primary-900: #7c2d12;
+  --color-primary-950: #431407;
+  --color-ink: #140c06;
+  --color-sand: #fff8f0;
+  --font-display: "Rajdhani", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "Mukta", ui-sans-serif, system-ui, sans-serif;
+}
+
+:root {
+  background-color: #fff8f0;
+  color: #1c1208;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background:
+    radial-gradient(circle at top right, rgba(237, 128, 27, 0.12), transparent 40%),
+    radial-gradient(circle at bottom left, rgba(237, 128, 27, 0.08), transparent 35%),
+    #fff8f0;
+  min-height: 100vh;
+}
+
+h1, h2, h3, .font-display {
+  font-family: var(--font-display);
+  letter-spacing: 0.01em;
+}
+
+.hide-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.hide-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #ed801b66;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #ED801B;
+}
+
+.bk-panel {
+  background: #ffffff;
+  border: 1px solid rgba(237, 128, 27, 0.14);
+  border-radius: 1.25rem;
+  box-shadow: 0 12px 40px rgba(80, 40, 0, 0.06);
+}
+
+.bk-panel-accent {
+  border-left: 4px solid #ED801B;
+}
+
+.bk-btn {
+  background: #ED801B;
+  color: #fff;
+  font-weight: 700;
+  border-radius: 0.9rem;
+  transition: all 0.2s ease;
+  box-shadow: 0 10px 24px rgba(237, 128, 27, 0.28);
+}
+
+.bk-btn:hover {
+  background: #d97706;
+}
+
+.bk-btn:active {
+  transform: scale(0.98);
+}
+
+.bk-btn:disabled {
+  opacity: 0.65;
+  cursor: not-allowed;
+}
+
+.bk-input {
+  width: 100%;
+  background: #fff8f0;
+  border: 1px solid rgba(237, 128, 27, 0.2);
+  border-radius: 0.9rem;
+  padding: 0.75rem 1rem;
+  outline: none;
+  transition: all 0.2s ease;
+}
+
+.bk-input:focus {
+  background: #fff;
+  border-color: #ED801B;
+  box-shadow: 0 0 0 3px rgba(237, 128, 27, 0.18);
+}
+
+/* Login form fields — fixed icon/text spacing + autofill */
+.login-field {
+  position: relative;
+  width: 100%;
+}
+
+.login-field-icon {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3rem;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ED801B;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.login-input {
+  width: 100%;
+  height: 3.1rem;
+  box-sizing: border-box;
+  background: #fff8f0;
+  border: 1px solid rgba(237, 128, 27, 0.22);
+  border-radius: 0.9rem;
+  padding: 0.75rem 1rem 0.75rem 3.15rem;
+  font-size: 0.95rem;
+  font-weight: 500;
+  color: #140c06;
+  outline: none;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, background 0.2s ease;
+}
+
+.login-input-password {
+  padding-right: 3.1rem;
+}
+
+.login-input::placeholder {
+  color: #a8a29e;
+  font-weight: 500;
+}
+
+.login-input:focus {
+  background: #ffffff;
+  border-color: #ED801B;
+  box-shadow: 0 0 0 3px rgba(237, 128, 27, 0.18);
+}
+
+.login-input:-webkit-autofill,
+.login-input:-webkit-autofill:hover,
+.login-input:-webkit-autofill:focus {
+  -webkit-text-fill-color: #140c06;
+  caret-color: #140c06;
+  box-shadow: 0 0 0 1000px #fff8f0 inset;
+  transition: background-color 99999s ease-in-out 0s;
+  border: 1px solid rgba(237, 128, 27, 0.22);
+  border-radius: 0.9rem;
+}
+
+.login-input:-webkit-autofill:focus {
+  box-shadow:
+    0 0 0 1000px #ffffff inset,
+    0 0 0 3px rgba(237, 128, 27, 0.18);
+  border-color: #ED801B;
+}
+
+/* Keep autofill values, hide Chrome contact/credential chips that overlap text */
+.login-input::-webkit-contacts-auto-fill-button,
+.login-input::-webkit-credentials-auto-fill-button {
+  visibility: hidden;
+  display: none !important;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+  width: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+}

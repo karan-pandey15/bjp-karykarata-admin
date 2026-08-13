@@ -38,8 +38,10 @@ const ScheduleManager = () => {
         api.get('/templates', muteToast),
         api.get('/templates?date=scheduled', muteToast)
       ]);
-      setAllTemplates(templatesRes.data.templates || templatesRes.data);
-      setScheduledTemplates(scheduledRes.data.templates || scheduledRes.data);
+      const all = templatesRes.data;
+      const scheduled = scheduledRes.data;
+      setAllTemplates(Array.isArray(all) ? all : all?.templates || []);
+      setScheduledTemplates(Array.isArray(scheduled) ? scheduled : scheduled?.templates || []);
     } catch (err) {
       console.error('Error fetching schedule data:', err);
     } finally {

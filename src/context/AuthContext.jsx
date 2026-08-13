@@ -47,21 +47,6 @@ export const AuthProvider = ({ children }) => {
       showSuccess(data.message || 'Welcome back to BJP Karyakarta');
       return { ok: true };
     } catch (error) {
-      // Fallback for local mock when backend login is unavailable
-      if (error?.response?.status === 404 || error?.code === 'ERR_NETWORK') {
-        const mockUser = {
-          name: 'BJP Admin',
-          email: email || 'admin@bjpkaryakarta.in',
-          role: 'admin',
-        };
-        const mockToken = 'mock-jwt-token-' + Math.random().toString(36).substring(7);
-        setUser(mockUser);
-        localStorage.setItem('user', JSON.stringify(mockUser));
-        localStorage.setItem('token', mockToken);
-        showSuccess('Logged in successfully');
-        return { ok: true, mock: true };
-      }
-
       showError(getErrorMessage(error, 'Login failed'));
       return { ok: false, error };
     }

@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Plus, Tags, Edit2, Trash2, FolderOpen, Save } from 'lucide-react';
-import api, { muteToast } from '../services/api';
+import api from '../services/api';
+import { fetchCategoriesList } from '../services/categoriesApi';
 import SearchInput from '../components/SearchInput';
 import { useConfirm } from '../context/ConfirmContext';
 
@@ -21,8 +22,8 @@ const Categories = () => {
   const fetchCategories = async () => {
     try {
       setLoading(true);
-      const res = await api.get('/categories', muteToast);
-      setCategories(res.data);
+      const list = await fetchCategoriesList();
+      setCategories(Array.isArray(list) ? list : []);
     } catch (err) {
       console.error('Error fetching categories:', err);
     } finally {

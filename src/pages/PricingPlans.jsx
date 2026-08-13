@@ -33,7 +33,8 @@ const PricingPlans = () => {
     try {
       setLoading(true);
       const res = await api.get('/plans', muteToast);
-      setPlans(res.data);
+      const data = res.data;
+      setPlans(Array.isArray(data) ? data : data?.plans || []);
     } catch (err) {
       console.error('Error fetching plans:', err);
     } finally {

@@ -1,18 +1,28 @@
 import axios from 'axios';
 import { getErrorMessage, showError, showSuccess } from '../utils/toast';
 
+const PRODUCTION_API = 'https://api.pracharpost.in/api';
+
+const normalizeBaseUrl = (url) => {
+  let value = String(url).trim().replace(/\/$/, '');
+
+  // Production host must always be HTTPS (avoids mixed-content blocks)
+  value = value.replace(/^http:\/\/api\.pracharpost\.in/i, 'https://api.pracharpost.in');
+
+  // Routes live under /api — append it if only the origin was provided
+  if (/^https:\/\/api\.pracharpost\.in$/i.test(value)) {
+    value = `${value}/api`;
+  }
+
+  return value;
+};
+
 const getBaseUrl = () => {
   const fromEnv = import.meta.env.VITE_API_BASE_URL;
   if (fromEnv && String(fromEnv).trim()) {
-    return String(fromEnv).trim().replace(/\/$/, '');
+    return normalizeBaseUrl(fromEnv);
   }
-
-  const hostname = window.location.hostname;
-
-  if (hostname === 'localhost') return 'http://localhost:8000/api';
-  if (/^(\d{1,3}\.){3}\d{1,3}$/.test(hostname)) return `http://${hostname}:8000/api`;
-
-  return 'https://lotus-backend-nine.vercel.app/api';
+  return PRODUCTION_API;
 };
 
 const API_BASE_URL = getBaseUrl();
@@ -70,4 +80,5 @@ export const muteToast = { muteToast: true };
 /** Mute both success and error toasts (manual handling) */
 export const muteAllToasts = { muteToast: true, muteErrorToast: true };
 
+export { API_BASE_URL };
 export default api;

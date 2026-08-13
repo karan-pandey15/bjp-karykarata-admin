@@ -33,6 +33,7 @@ import {
 import { Canvas, IText, FabricImage, Rect, Circle, Line } from 'fabric';
 import { Reorder, useDragControls } from 'framer-motion';
 import api, { muteToast } from '../services/api';
+import { fetchCategoriesList } from '../services/categoriesApi';
 import { initAligningGuidelines } from '../utils/initAligningGuidelines';
 import { showError } from '../utils/toast';
 import { useConfirm } from '../context/ConfirmContext';
@@ -606,10 +607,11 @@ const TemplateEditor = () => {
 
   const fetchCategories = async () => {
     try {
-      const res = await api.get('/categories', muteToast);
-      setCategories(res.data);
+      const list = await fetchCategoriesList();
+      setCategories(Array.isArray(list) ? list : []);
     } catch (err) {
       console.error('Error fetching categories:', err);
+      setCategories([]);
     }
   };
 
@@ -617,8 +619,9 @@ const TemplateEditor = () => {
     try {
       setIsMediaLoading(true);
       const res = await api.get('/templates/media', muteToast);
-      console.log('FRONTEND MEDIA FETCH SUCCESS:', res.data.length, 'items');
-      setMediaLibrary(res.data);
+      const data = res.data;
+      const items = Array.isArray(data) ? data : data?.media || data?.items || [];
+      setMediaLibrary(items);
     } catch (err) {
       console.error('Error fetching media library:', err);
     } finally {

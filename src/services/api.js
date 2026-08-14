@@ -1,17 +1,19 @@
 import axios from 'axios';
 import { getErrorMessage, showError, showSuccess } from '../utils/toast';
 
-const PRODUCTION_API = 'https://api.pracharpost.in/api';
+/** Live Lotus backend — always use this host */
+export const API_ORIGIN = 'https://api.pracharpost.in';
+export const PRODUCTION_API = `${API_ORIGIN}/api`;
 
 const normalizeBaseUrl = (url) => {
-  let value = String(url).trim().replace(/\/$/, '');
+  let value = String(url || '').trim().replace(/\/$/, '');
+  if (!value) return PRODUCTION_API;
 
-  // Production host must always be HTTPS (avoids mixed-content blocks)
   value = value.replace(/^http:\/\/api\.pracharpost\.in/i, 'https://api.pracharpost.in');
 
-  // Routes live under /api — append it if only the origin was provided
+  // Origin only → append /api (routes live under /api)
   if (/^https:\/\/api\.pracharpost\.in$/i.test(value)) {
-    value = `${value}/api`;
+    return `${value}/api`;
   }
 
   return value;
@@ -40,6 +42,12 @@ api.interceptors.request.use(
     if (token) {
       config.headers.Authorization = `Bearer ${token}`;
     }
+
+    // Let the browser set multipart boundary for file uploads
+    if (config.data instanceof FormData) {
+      delete config.headers['Content-Type'];
+    }
+
     return config;
   },
   (error) => Promise.reject(error)

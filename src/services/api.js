@@ -21,10 +21,15 @@ const normalizeBaseUrl = (url) => {
 
 const getBaseUrl = () => {
   const fromEnv = import.meta.env.VITE_API_BASE_URL;
-  if (fromEnv && String(fromEnv).trim()) {
-    return normalizeBaseUrl(fromEnv);
+  const normalized = fromEnv && String(fromEnv).trim() ? normalizeBaseUrl(fromEnv) : '';
+
+  // Never use a relative `/api` path in production builds (that hits the
+  // frontend host, not PracharPost, and login returns HTML → no token).
+  if (!normalized || normalized.startsWith('/') || !/pracharpost\.in/i.test(normalized)) {
+    return PRODUCTION_API;
   }
-  return PRODUCTION_API;
+
+  return normalized;
 };
 
 const API_BASE_URL = getBaseUrl();
@@ -38,9 +43,13 @@ const api = axios.create({
 
 api.interceptors.request.use(
   (config) => {
-    const token = localStorage.getItem('token');
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
+    if (config.skipAuth) {
+      delete config.headers.Authorization;
+    } else {
+      const token = localStorage.getItem('token');
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
     }
 
     // Let the browser set multipart boundary for file uploads

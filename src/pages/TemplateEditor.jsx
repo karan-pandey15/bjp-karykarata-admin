@@ -274,6 +274,37 @@ const TemplateEditor = () => {
     setActiveObject(null);
   }, [canvas, activeObject]);
 
+  const applyFillColor = useCallback(
+    (color) => {
+      if (!canvas || !activeObject || !color) return;
+      const obj = activeObject;
+      const isText = String(obj.type || '').toLowerCase().includes('text');
+
+      if (isText && typeof obj.setSelectionStyles === 'function') {
+        const start = obj.selectionStart ?? 0;
+        const end = obj.selectionEnd ?? 0;
+        try {
+          if (obj.isEditing && end !== start) {
+            obj.setSelectionStyles({ fill: color });
+          } else {
+            obj.set('fill', color);
+            const len = (obj.text || '').length;
+            if (len > 0) obj.setSelectionStyles({ fill: color }, 0, len);
+          }
+        } catch {
+          obj.set('fill', color);
+        }
+      } else {
+        obj.set('fill', color);
+      }
+
+      canvas.renderAll();
+      setIsDirty(true);
+      setRenderTick((t) => t + 1);
+    },
+    [canvas, activeObject]
+  );
+
   // Unsaved changes protection
   useEffect(() => {
     const handleBeforeUnload = (e) => {
@@ -1328,6 +1359,24 @@ const TemplateEditor = () => {
                   </div>
                   <div className="w-px h-6 bg-white/10 mx-1" />
 
+                  {/* Text color — Canva-style, left of Bold */}
+                  <label
+                    className="relative flex flex-col items-center justify-center w-9 h-[34px] rounded-xl hover:bg-white/10 cursor-pointer shrink-0"
+                    title="Text color"
+                  >
+                    <span className="text-[13px] font-black leading-none text-white">A</span>
+                    <span
+                      className="mt-[3px] w-4 h-[3px] rounded-sm ring-1 ring-white/25"
+                      style={{ backgroundColor: normalizeColor(activeObject.fill) }}
+                    />
+                    <input
+                      type="color"
+                      value={normalizeColor(activeObject.fill)}
+                      onChange={(e) => applyFillColor(e.target.value)}
+                      className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0 border-0"
+                    />
+                  </label>
+
                   <button onClick={() => { activeObject.set('fontWeight', activeObject.fontWeight === 'bold' ? 'normal' : 'bold'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.fontWeight === 'bold' ? 'bg-white text-ink' : 'hover:bg-white/10'}`}><Bold size={16} /></button>
                   <button onClick={() => { activeObject.set('fontStyle', activeObject.fontStyle === 'italic' ? 'normal' : 'italic'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.fontStyle === 'italic' ? 'bg-white text-ink' : 'hover:bg-white/10'}`}><Italic size={16} /></button>
 
@@ -1454,25 +1503,22 @@ const TemplateEditor = () => {
               </div>
               <div className="w-px h-6 bg-white/10 mx-1 shrink-0" />
 
-              {/* Color Control */}
-              <div className="flex items-center gap-2 px-2 group shrink-0">
-                <div
-                  className="w-5 h-5 rounded-full border border-white/20 shadow-inner relative"
-                  style={{ backgroundColor: activeObject.fill || '#000000' }}
-                >
-                  <input
-                    type="color"
-                    value={normalizeColor(activeObject.fill)}
-                    onChange={(e) => {
-                      activeObject.set('fill', e.target.value);
-                      canvas.renderAll();
-                      setIsDirty(true);
-                      setRenderTick(t => t + 1);
-                    }}
-                    className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0"
-                  />
+              {/* Fill color for shapes / images (text uses the A color control) */}
+              {!String(activeObject?.type || '').toLowerCase().includes('text') && (
+                <div className="flex items-center gap-2 px-2 group shrink-0" title="Fill color">
+                  <div
+                    className="w-5 h-5 rounded-full border border-white/20 shadow-inner relative"
+                    style={{ backgroundColor: normalizeColor(activeObject.fill) }}
+                  >
+                    <input
+                      type="color"
+                      value={normalizeColor(activeObject.fill)}
+                      onChange={(e) => applyFillColor(e.target.value)}
+                      className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0"
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className="w-px h-6 bg-white/10 mx-1" />
               

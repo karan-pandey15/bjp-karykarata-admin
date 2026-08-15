@@ -1,7 +1,10 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Plus, LayoutTemplate, Edit2, Trash2, Smartphone, Image as ImageIcon } from 'lucide-react';
-import api, { muteToast } from '../services/api';
+import {
+  listTemplates,
+  deleteTemplate,
+} from '../services/templatesApi';
 import SearchInput from '../components/SearchInput';
 import { useConfirm } from '../context/ConfirmContext';
 
@@ -22,9 +25,8 @@ const Templates = () => {
 
   const fetchTemplates = async () => {
     try {
-      const response = await api.get('/templates', muteToast);
-      const data = response.data;
-      setTemplates(Array.isArray(data) ? data : data?.templates || []);
+      const data = await listTemplates({ limit: 100 });
+      setTemplates(data?.templates || []);
     } catch (error) {
       console.error('Error fetching templates:', error);
     } finally {
@@ -32,7 +34,8 @@ const Templates = () => {
     }
   };
 
-  const deleteTemplate = async (id) => {
+  const deleteTemplateById = async (templateId) => {
+    if (!templateId) return;
     const ok = await confirm({
       title: 'Delete template?',
       message: 'Delete this template permanently? This cannot be undone.',
@@ -42,8 +45,8 @@ const Templates = () => {
     });
     if (!ok) return;
     try {
-      await api.delete(`/templates/${id}`, { successMessage: 'Template deleted' });
-      setTemplates(templates.filter((t) => t._id !== id));
+      await deleteTemplate(templateId);
+      setTemplates((prev) => prev.filter((t) => t._id !== templateId));
     } catch (error) {
       console.error('Error deleting template:', error);
     }
@@ -150,7 +153,7 @@ const Templates = () => {
                 <h4 className="font-bold text-ink truncate">{template.name}</h4>
                 <div className="flex items-center justify-between mt-3 text-[10px] font-bold uppercase tracking-widest text-stone-400">
                   <span>{template.ratio || 'Custom'}</span>
-                  <button onClick={() => deleteTemplate(template._id)} className="text-red-400 hover:text-red-600">
+                  <button onClick={() => deleteTemplateById(template._id)} className="text-red-400 hover:text-red-600">
                     <Trash2 size={16} />
                   </button>
                 </div>

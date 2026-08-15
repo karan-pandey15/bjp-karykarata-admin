@@ -32,15 +32,23 @@ import {
 } from 'lucide-react';
 import { Canvas, IText, FabricImage, Rect, Circle, Line } from 'fabric';
 import { Reorder, useDragControls } from 'framer-motion';
-import api, { muteToast } from '../services/api';
+import {
+  getTemplate,
+  createTemplate,
+  updateTemplate,
+  listTemplateMedia,
+  uploadTemplateImage,
+  deleteTemplateMedia,
+} from '../services/templatesApi';
 import { fetchCategoriesList } from '../services/categoriesApi';
 import { initAligningGuidelines } from '../utils/initAligningGuidelines';
-import { showError } from '../utils/toast';
+import { showError, getErrorMessage } from '../utils/toast';
 import { useConfirm } from '../context/ConfirmContext';
 
 // Helper to normalize colors for <input type="color">
 const normalizeColor = (color) => {
   if (!color) return '#000000';
+  if (typeof color !== 'string') return '#000000';
   if (color.startsWith('#')) return color;
 
   if (color.startsWith('rgb')) {
@@ -50,6 +58,81 @@ const normalizeColor = (color) => {
     }
   }
   return '#000000';
+};
+
+const FABRIC_JSON_PROPS = [
+  'id',
+  'role',
+  'uppercase',
+  'selectable',
+  'evented',
+  'name',
+];
+
+const SIZE_FROM_KEY = {
+  post: { size: 'POST', platform: 'IG' },
+  story: { size: 'STORY', platform: 'IG' },
+  portrait: { size: 'POST', platform: 'IG' },
+  fb_post: { size: 'POST', platform: 'FB' },
+  banner: { size: 'BANNER', platform: 'FB' },
+  twitter: { size: 'POST', platform: 'X' },
+  youtube: { size: 'POST', platform: 'YT' },
+  linkedin: { size: 'BANNER', platform: 'LI' },
+  custom: { size: 'CUSTOM', platform: 'IG' },
+};
+
+const PRESET_BY_SIZE = {
+  POST: { width: 1080, height: 1080, ratio: '1:1', key: 'post' },
+  STORY: { width: 1080, height: 1920, ratio: '9:16', key: 'story' },
+  BANNER: { width: 820, height: 312, ratio: '2.6:1', key: 'banner' },
+  CUSTOM: { width: 1080, height: 1080, ratio: '1:1', key: 'custom' },
+};
+
+const parseFabricJSON = (raw) => {
+  if (!raw) return null;
+  if (typeof raw === 'string') {
+    try {
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof raw === 'object') return raw;
+  return null;
+};
+
+const resolveDesignSize = (template, fallback) => {
+  const json = parseFabricJSON(template?.fabricJSON);
+  if (json?.width && json?.height) {
+    return {
+      width: Number(json.width),
+      height: Number(json.height),
+      ratio: template.ratio || `${json.width}:${json.height}`,
+      name: template.size || fallback.name,
+    };
+  }
+
+  const sizeKey = String(template?.size || '').toUpperCase();
+  if (PRESET_BY_SIZE[sizeKey] && sizeKey !== 'CUSTOM') {
+    const p = PRESET_BY_SIZE[sizeKey];
+    return { width: p.width, height: p.height, ratio: template.ratio || p.ratio, name: sizeKey };
+  }
+
+  if (template?.ratio && /^\d+(\.\d+)?:\d+(\.\d+)?$/.test(template.ratio)) {
+    const [rw, rh] = template.ratio.split(':').map(Number);
+    if (rw > 0 && rh > 0) {
+      const width = 1080;
+      const height = Math.round((1080 * rh) / rw);
+      return { width, height, ratio: template.ratio, name: sizeKey || 'Custom' };
+    }
+  }
+
+  return {
+    width: fallback.width,
+    height: fallback.height,
+    ratio: template?.ratio || fallback.ratio,
+    name: fallback.name,
+  };
 };
 
 // Stable ID generator for Fabric objects
@@ -78,10 +161,12 @@ const TemplateEditor = () => {
   const [mediaLibrary, setMediaLibrary] = useState([]);
   const [isMediaLoading, setIsMediaLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [sizeOverride, setSizeOverride] = useState(null);
 
   // Layout & UI State
   const [activeTab, setActiveTab] = useState('design'); // 'design' | 'layers'
   const [layers, setLayers] = useState([]);
+  const savedIdRef = useRef(id || null);
   const isDragging = useRef(false);
   const undoStack = useRef([]);
   const redoStack = useRef([]);
@@ -105,17 +190,17 @@ const TemplateEditor = () => {
     custom: {
       width: parseInt(searchParams.get('w')) || 1080,
       height: parseInt(searchParams.get('h')) || 1080,
-      ratio: `${searchParams.get('w')}:${searchParams.get('h')}`,
+      ratio: `${searchParams.get('w') || 1080}:${searchParams.get('h') || 1080}`,
       name: 'Custom Size'
     }
   };
 
-  const currentConfig = configs[canvasType] || configs.post;
+  const currentConfig = sizeOverride || configs[canvasType] || configs.post;
 
   // --- CORE WORKFLOW & DESIGN TOOLS (Declared early for useEffect dependencies) ---
   const saveHistory = useCallback((canvasInstance = canvas) => {
     if (!canvasInstance || isInternalChange.current) return;
-    const json = JSON.stringify(canvasInstance.toJSON(['id', 'role']));
+    const json = JSON.stringify(canvasInstance.toJSON(FABRIC_JSON_PROPS));
 
     // Only push if different from last state to avoid duplicates
     const lastState = undoStack.current[undoStack.current.length - 1];
@@ -205,6 +290,8 @@ const TemplateEditor = () => {
 
     const text = new IText(content, {
       id: generateId(),
+      role:
+        textType === 'heading' ? 'title' : textType === 'subheading' ? 'subtitle' : 'none',
       left: currentConfig.width / 2,
       top: currentConfig.height / 2,
       fontSize: fontSize,
@@ -317,24 +404,27 @@ const TemplateEditor = () => {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [isDirty]);
 
-  const zoomToFit = useCallback((canvasInstance) => {
+  const zoomToFit = useCallback((canvasInstance, sizeHint) => {
     const container = document.getElementById('canvas-viewport');
     if (!container || !canvasInstance) return;
 
-    // Stable padding so sidebar/layout changes don't crush the canvas
-    const pad = 64;
+    const designW = sizeHint?.width || currentConfig.width;
+    const designH = sizeHint?.height || currentConfig.height;
+
+    // Extra padding so the template never sits under the properties dock
+    const pad = 80;
     const availableWidth = Math.max(container.clientWidth - pad, 200);
     const availableHeight = Math.max(container.clientHeight - pad, 200);
 
-    const scaleX = availableWidth / currentConfig.width;
-    const scaleY = availableHeight / currentConfig.height;
+    const scaleX = availableWidth / designW;
+    const scaleY = availableHeight / designH;
     const finalScale = Math.min(scaleX, scaleY, 1);
     const safeScale = Math.max(finalScale, 0.08);
 
     canvasInstance.setZoom(safeScale);
     canvasInstance.setDimensions({
-      width: currentConfig.width * safeScale,
-      height: currentConfig.height * safeScale,
+      width: designW * safeScale,
+      height: designH * safeScale,
     });
 
     setZoomLevel(safeScale);
@@ -649,9 +739,7 @@ const TemplateEditor = () => {
   const fetchMediaLibrary = async () => {
     try {
       setIsMediaLoading(true);
-      const res = await api.get('/templates/media', muteToast);
-      const data = res.data;
-      const items = Array.isArray(data) ? data : data?.media || data?.items || [];
+      const items = await listTemplateMedia();
       setMediaLibrary(items);
     } catch (err) {
       console.error('Error fetching media library:', err);
@@ -660,9 +748,72 @@ const TemplateEditor = () => {
     }
   };
 
+  const rebuildCanvasFromLayers = async (canvasInstance, template, design) => {
+    canvasInstance.clear();
+    canvasInstance.backgroundColor = template.baseColor || '#ffffff';
 
+    const images = Array.isArray(template.images) ? template.images : [];
+    for (const layer of images) {
+      const src = layer.image || layer.url;
+      if (!src) continue;
+      try {
+        const img = await FabricImage.fromURL(src, { crossOrigin: 'anonymous' });
+        const targetW = (layer.width || 1) * design.width;
+        const targetH = (layer.height || 1) * design.height;
+        const scale = Math.min(
+          targetW / (img.width || 1),
+          targetH / (img.height || 1)
+        );
+        img.set({
+          id: generateId(),
+          role: layer.role || (layer.isBackground ? 'background' : 'none'),
+          originX: 'center',
+          originY: 'center',
+          left: (layer.x ?? 0.5) * design.width,
+          top: (layer.y ?? 0.5) * design.height,
+          scaleX: scale,
+          scaleY: scale,
+          angle: layer.angle || 0,
+          opacity: layer.opacity ?? 1,
+          name: layer.isBackground ? 'background' : undefined,
+        });
+        canvasInstance.add(img);
+      } catch (e) {
+        console.warn('Failed to restore image layer', e);
+      }
+    }
 
+    const texts = [];
+    if (template.title?.text) texts.push({ ...template.title, role: template.title.role || 'title' });
+    if (template.subtitle?.text) texts.push({ ...template.subtitle, role: template.subtitle.role || 'subtitle' });
+    if (Array.isArray(template.textLayers)) texts.push(...template.textLayers);
 
+    texts.forEach((t) => {
+      const text = new IText(t.text || '', {
+        id: generateId(),
+        role: t.role || 'none',
+        left: (t.x ?? 0.5) * design.width,
+        top: (t.y ?? 0.5) * design.height,
+        originX: 'center',
+        originY: 'center',
+        fontSize: t.size || 32,
+        fontFamily: t.font || 'Inter',
+        fill: t.color || '#000000',
+        fontWeight: t.bold ? 'bold' : 'normal',
+        fontStyle: t.italic ? 'italic' : 'normal',
+        textAlign: t.textAlign || t.alignment || 'center',
+        charSpacing: t.letterSpacing || 0,
+        lineHeight: t.lineHeight || 1.16,
+        angle: t.angle || 0,
+        opacity: t.opacity ?? 1,
+        stroke: t.strokeColor || undefined,
+        strokeWidth: t.strokeWidth || 0,
+        uppercase: !!t.uppercase,
+      });
+      if (t.uppercase && text.text) text.set('text', String(text.text).toUpperCase());
+      canvasInstance.add(text);
+    });
+  };
 
   const handleManualZoom = (newZoom) => {
     if (!canvas) return;
@@ -679,58 +830,73 @@ const TemplateEditor = () => {
   const loadTemplate = async (templateId, canvasInstance) => {
     try {
       setLoading(true);
-      const res = await api.get(`/templates/${templateId}`, muteToast);
-      const template = res.data;
-      setTemplateName(template.name);
-      setCategory(template.category);
+      const template = await getTemplate(templateId);
+      if (!template?._id) {
+        showError(template?.message || 'Template not found');
+        navigate('/templates');
+        return;
+      }
+
+      savedIdRef.current = template._id;
+      setTemplateName(template.name || 'Untitled Template');
+      setCategory(template.category || 'General');
       setCategoryId(template.categoryId?._id || template.categoryId || '');
-      setIsHeroSection(template.isHeroSection || false);
+      setIsHeroSection(!!template.isHeroSection);
       if (template.scheduledDate) {
         setScheduledDate(new Date(template.scheduledDate).toISOString().split('T')[0]);
+      } else {
+        setScheduledDate('');
       }
       setTemplateType(template.type || 'CONTENT');
 
-      if (template.fabricJSON) {
-        // Prevent loading into a disposed canvas (React Strict Mode double mount issue)
-        if (canvasInstance && canvasInstance.contextContainer) {
-          await canvasInstance.loadFromJSON(template.fabricJSON);
+      const fallback = configs[canvasType] || configs.post;
+      const design = resolveDesignSize(template, fallback);
+      setSizeOverride({
+        width: design.width,
+        height: design.height,
+        ratio: design.ratio,
+        name: design.name || fallback.name,
+      });
 
-          // --- LOGGING JSON AND ELEMENT PROPERTIES ---
-          console.groupCollapsed('🔍 [DEBUG] TEMPLATE LOADED');
-          console.log('Raw Fabric JSON:', template.fabricJSON);
-          const objects = canvasInstance.getObjects();
-          console.log(`Total Canvas Elements: ${objects.length}`);
-          objects.forEach((obj, i) => {
-            // Assign ID to loaded objects if missing
-            if (!obj.id) obj.id = generateId();
-
-            console.log(`[${i}] ${obj.type.toUpperCase()}`, {
-              type: obj.type,
-              text: obj.text || null,
-              width: obj.width,
-              height: obj.height,
-              scaleX: obj.scaleX,
-              scaleY: obj.scaleY,
-              fontSize: obj.fontSize || null,
-              fill: obj.fill,
-              left: obj.left,
-              top: obj.top,
-              angle: obj.angle,
-              rawObject: obj
-            });
-          });
-          console.groupEnd();
-
-          canvasInstance.renderAll();
-          zoomToFit(canvasInstance);
-          setIsDirty(false);
-        } else {
-          console.warn('Canvas disposed before template could load.');
-        }
+      if (!canvasInstance?.contextContainer) {
+        console.warn('Canvas disposed before template could load.');
+        return;
       }
 
+      isInternalChange.current = true;
+      canvasInstance.setZoom(1);
+      canvasInstance.setDimensions({ width: design.width, height: design.height });
+
+      const fabricJSON = parseFabricJSON(template.fabricJSON);
+      const hasObjects = Array.isArray(fabricJSON?.objects) && fabricJSON.objects.length > 0;
+
+      if (hasObjects || fabricJSON?.background || fabricJSON?.backgroundImage) {
+        await canvasInstance.loadFromJSON(fabricJSON);
+      } else {
+        await rebuildCanvasFromLayers(canvasInstance, template, design);
+      }
+
+      canvasInstance.getObjects().forEach((obj) => {
+        if (!obj.id) obj.id = generateId();
+      });
+
+      canvasInstance.requestRenderAll();
+      syncLayers(canvasInstance);
+      undoStack.current = [JSON.stringify(canvasInstance.toJSON(FABRIC_JSON_PROPS))];
+      redoStack.current = [];
+      isInternalChange.current = false;
+
+      setTimeout(() => zoomToFit(canvasInstance, design), 50);
+      setTimeout(() => {
+        zoomToFit(canvasInstance, design);
+        syncLayers(canvasInstance);
+      }, 200);
+
+      setIsDirty(false);
     } catch (err) {
       console.error('Error loading template:', err);
+      showError(getErrorMessage(err, 'Failed to load template'));
+      isInternalChange.current = false;
     } finally {
       setLoading(false);
     }
@@ -760,19 +926,12 @@ const TemplateEditor = () => {
       if (window.innerWidth < 1024) setIsSidebarOpen(false);
 
       // 2) Upload to backend and swap to permanent URL when available
-      const formData = new FormData();
-      formData.append('image', file);
-
-      const res = await api.post('/templates/upload', formData, {
-        headers: { 'Content-Type': 'multipart/form-data' },
-        successMessage: 'Image uploaded successfully',
-        onUploadProgress: (progressEvent) => {
-          const progress = Math.round((progressEvent.loaded * 100) / (progressEvent.total || 1));
-          setUploadProgress(progress);
-        },
+      const uploaded = await uploadTemplateImage(file, (progressEvent) => {
+        const progress = Math.round((progressEvent.loaded * 100) / (progressEvent.total || 1));
+        setUploadProgress(progress);
       });
 
-      const imageUrl = res.data?.url || res.data?.imageUrl || res.data?.data?.url;
+      const imageUrl = uploaded?.url || uploaded?.imageUrl || uploaded?.data?.url;
       let swappedToServer = false;
       if (imageUrl && img) {
         try {
@@ -833,7 +992,7 @@ const TemplateEditor = () => {
 
     try {
       setIsMediaLoading(true);
-      await api.delete(`/templates/media/${id}`, { successMessage: 'Image deleted' });
+      await deleteTemplateMedia(id);
       fetchMediaLibrary();
     } catch (err) {
       console.error('Delete failed:', err);
@@ -850,97 +1009,135 @@ const TemplateEditor = () => {
     const objects = canvas.getObjects();
     const images = [];
     const textLayers = [];
+    let title = null;
+    let subtitle = null;
 
-    // Use actual internal canvas dimensions for normalization
-    const canvasWidth = canvas.width;
-    const canvasHeight = canvas.height;
+    const baseWidth = currentConfig.width;
+    const baseHeight = currentConfig.height;
+    const sizeMeta = SIZE_FROM_KEY[canvasType] || SIZE_FROM_KEY.post;
 
-    // Explicitly handle Background
     const bgImage = canvas.backgroundImage;
     if (bgImage) {
       images.push({
-        image: bgImage.src,
-        x: 0, y: 0, width: 1, height: 1,
+        image: bgImage.getSrc?.() || bgImage.src,
         fit: 'cover',
+        type: 'background',
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        scale: 1,
+        angle: 0,
+        opacity: 1,
+        zIndex: -1,
         isBackground: true,
-        zIndex: -1
+        role: 'background',
       });
     }
 
     objects.forEach((obj, index) => {
-      // 1. STABLE RESOLUTION SYNC
-      // Always use the base resolution (1080px), NOT the current zoomed canvas width
-      const baseWidth = currentConfig.width;
-      const baseHeight = currentConfig.height;
-
-      // 2. Capture the VISUAL CENTER while the design is in its final state
-      // Capture this before un-rotating to ensure the pivot is correct
       const center = obj.getCenterPoint();
       const x = center.x / baseWidth;
       const y = center.y / baseHeight;
 
-      // 3. Temporarily un-rotate ONLY to get the pure rectangle dimensions
       const originalAngle = obj.angle || 0;
       obj.set('angle', 0);
       obj.setCoords();
 
-      const width = (obj.type.includes('text') ? obj.width * obj.scaleX : obj.getScaledWidth()) / baseWidth;
-      const height = (obj.type.includes('text') ? obj.height * obj.scaleY : obj.getScaledHeight()) / baseHeight;
+      const typeName = String(obj.type || '').toLowerCase();
+      const width =
+        (typeName.includes('text') ? obj.width * obj.scaleX : obj.getScaledWidth()) / baseWidth;
+      const height =
+        (typeName.includes('text') ? obj.height * obj.scaleY : obj.getScaledHeight()) / baseHeight;
 
-      // 4. Restore original angle immediately
       obj.set('angle', originalAngle);
       obj.setCoords();
 
-      const opacity = obj.opacity || 1;
+      const opacity = obj.opacity ?? 1;
       const zIndex = index;
-
       const isForcedBackground = obj.id === 'background' || obj.name === 'background';
 
-      if (obj.type === 'image' || obj.type === 'image-layer') {
+      if (typeName.includes('image')) {
         images.push({
-          image: obj._element?.src || obj.src,
-          x, y, width, height,
-          angle: originalAngle, opacity, zIndex,
+          image: obj.getSrc?.() || obj._element?.src || obj.src,
           fit: 'contain',
+          type: isForcedBackground ? 'background' : 'image',
+          x,
+          y,
+          width,
+          height,
+          scale: obj.scaleX || 1,
+          angle: originalAngle,
+          opacity,
+          zIndex,
           isBackground: isForcedBackground,
-          role: obj.role || 'none'
+          role: obj.role || (isForcedBackground ? 'background' : 'none'),
         });
-      } else if (obj.type.includes('text')) {
-        textLayers.push({
+      } else if (typeName.includes('text')) {
+        const layer = {
           text: obj.text,
-          font: obj.fontFamily,
-          size: obj.fontSize * (obj.scaleY || 1),
-          sizeRatio: (obj.fontSize * (obj.scaleY || 1)) / baseWidth, // Honest size ratio capturing true visual scale
-          color: obj.fill,
-          x, y,
-          width, height,
-          angle: originalAngle, opacity, zIndex,
-          bold: obj.fontWeight === 'bold',
+          font: obj.fontFamily || 'Inter',
+          size: Math.round((obj.fontSize || 32) * (obj.scaleY || 1)),
+          sizeRatio: ((obj.fontSize || 32) * (obj.scaleY || 1)) / baseWidth,
+          color: typeof obj.fill === 'string' ? obj.fill : '#000000',
+          x,
+          y,
+          width,
+          height,
+          angle: originalAngle,
+          opacity,
+          zIndex,
+          bold: obj.fontWeight === 'bold' || obj.fontWeight === 700 || obj.fontWeight === '700',
           italic: obj.fontStyle === 'italic',
+          alignment: obj.textAlign || 'left',
           textAlign: obj.textAlign || 'left',
           letterSpacing: obj.charSpacing || 0,
           lineHeight: obj.lineHeight || 1.16,
-          uppercase: obj.uppercase || false,
+          uppercase: !!obj.uppercase,
           strokeColor: obj.stroke || '#000000',
-           strokeWidth: obj.strokeWidth || 0,
-          role: obj.role || 'none'
-        });
+          strokeWidth: obj.strokeWidth || 0,
+          role: obj.role || 'none',
+        };
+
+        if (layer.role === 'title' && !title) title = layer;
+        else if (layer.role === 'subtitle' && !subtitle) subtitle = layer;
+        else textLayers.push(layer);
       }
     });
 
+    // If no explicit title role, promote first text layer for mobile clients
+    if (!title && textLayers.length) {
+      title = { ...textLayers[0], role: 'title' };
+      textLayers.shift();
+    }
+    if (!subtitle && textLayers.length) {
+      subtitle = { ...textLayers[0], role: 'subtitle' };
+      textLayers.shift();
+    }
+
+    const fabricJSON = canvas.toJSON(FABRIC_JSON_PROPS);
+    fabricJSON.width = baseWidth;
+    fabricJSON.height = baseHeight;
+
     return {
-      name: templateName,
-      category: category,
-      categoryId: categoryId || null,
-       isHeroSection: isHeroSection,
-      type: templateType,
-      scheduledDate: scheduledDate || null,
-      baseColor: canvas.backgroundColor,
+      name: templateName || 'Untitled Template',
+      type: templateType || 'CONTENT',
+      category: category || 'General',
+      categoryId: categoryId || undefined,
+      isHeroSection: !!isHeroSection,
+      scheduledDate: scheduledDate ? new Date(scheduledDate).toISOString() : null,
+      baseColor: canvas.backgroundColor || '#FFFFFF',
+      defaultText: title?.text || textLayers[0]?.text || '',
+      size: sizeOverride?.name && PRESET_BY_SIZE[String(sizeOverride.name).toUpperCase()]
+        ? String(sizeOverride.name).toUpperCase()
+        : sizeMeta.size,
       ratio: currentConfig.ratio,
-      size: canvasType.toUpperCase(),
+      platform: sizeMeta.platform,
       images,
+      title: title || undefined,
+      subtitle: subtitle || undefined,
       textLayers,
-      fabricJSON: canvas.toJSON(['id', 'role'])
+      fabricJSON,
     };
   };
 
@@ -948,36 +1145,43 @@ const TemplateEditor = () => {
     const data = normalizeTemplate();
     if (!data) return;
 
-    // Generate accurate visual thumbnail for preview
+    if (!data.name?.trim()) {
+      showError('Template name is required');
+      return;
+    }
+
     const thumbnail = canvas.toDataURL({
       format: 'jpeg',
       quality: 0.8,
-      multiplier: 0.8 // High enough for mobile preview, low enough for storage
+      multiplier: 0.8,
     });
-
     data.thumbnail = thumbnail;
-
-    // --- DEBUG LOG FOR JSON PAYLOAD ---
-    console.group('🚀 [DEBUG] SAVING TEMPLATE JSON');
-    console.log('Sending this payload to Database:');
-    const debugData = { ...data };
-    delete debugData.fabricJSON; // Hide huge string
-    delete debugData.thumbnail;  // Hide huge base64
-    console.log(debugData);
-    console.groupEnd();
 
     try {
       setLoading(true);
+      const templateId = savedIdRef.current || id;
 
-      if (id) {
-        await api.put(`/templates/${id}`, data, { successMessage: 'Design saved successfully' });
+      if (templateId) {
+        const updated = await updateTemplate(templateId, data);
+        savedIdRef.current = updated?._id || templateId;
+        if (updated?.name) setTemplateName(updated.name);
+        if (updated?.category) setCategory(updated.category);
+        if (updated?.type) setTemplateType(updated.type);
+        setIsDirty(false);
       } else {
-        await api.post('/templates', data, { successMessage: 'Template created successfully' });
-        navigate('/templates');
+        const created = await createTemplate(data);
+        const newId = created?._id;
+        if (!newId) {
+          showError(created?.message || 'Create succeeded but no _id returned');
+          return;
+        }
+        savedIdRef.current = newId;
+        setIsDirty(false);
+        navigate(`/templates/edit/${newId}`, { replace: true });
       }
-      setIsDirty(false);
     } catch (err) {
       console.error('Save failed:', err);
+      showError(getErrorMessage(err, 'Failed to save template'));
     } finally {
       setLoading(false);
     }
@@ -1304,258 +1508,268 @@ const TemplateEditor = () => {
           </div>
         </aside>
 
-        {/* Dynamic Canvas Viewport */}
-        <main className="flex-1 relative flex items-center justify-center overflow-auto bg-[#e2e8f0] p-4 sm:p-12" id="canvas-viewport">
+        {/* Dynamic Canvas Viewport — toolbar docked above, never overlays template */}
+        <main className="flex-1 min-h-0 flex flex-col overflow-hidden bg-[#e2e8f0]">
+          {/* Properties dock: reserved strip above the canvas */}
           <div
-            className="bg-white shadow-[0_40px_100px_rgba(0,0,0,0.15)] rounded-sm overflow-hidden flex items-center justify-center"
+            className={`shrink-0 z-20 flex items-center justify-center px-3 sm:px-6 ${
+              activeObject ? 'pt-3 pb-3 min-h-[4rem]' : 'h-3'
+            }`}
           >
-            <canvas id="editor-canvas" />
+            {activeObject && (
+              <div className="flex items-center gap-1.5 bg-ink/90 backdrop-blur-xl text-white p-2 rounded-2xl shadow-2xl animate-in fade-in slide-in-from-top-2 duration-300 scale-90 sm:scale-100 overflow-x-auto max-w-[min(960px,calc(100%-1rem))] touch-pan-x hide-scrollbar border border-white/10">
+                {activeObject?.type?.includes('text') && (
+                  <>
+                    {/* Font Family Dropdown */}
+                    <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px]" title="Font Family">
+                      <select
+                        className="bg-transparent text-white text-xs outline-none cursor-pointer w-24"
+                        value={activeObject.fontFamily || 'Inter'}
+                        onChange={(e) => {
+                          activeObject.set('fontFamily', e.target.value);
+                          canvas.renderAll();
+                          setIsDirty(true);
+                          setRenderTick(t => t + 1);
+                        }}
+                      >
+                        <option value="Inter" className="text-black">Inter</option>
+                        <option value="Montserrat" className="text-black">Montserrat</option>
+                        <option value="Poppins" className="text-black">Poppins</option>
+                        <option value="Roboto" className="text-black">Roboto</option>
+                        <option value="Playfair Display" className="text-black">Playfair Display</option>
+                        <option value="Oswald" className="text-black">Oswald</option>
+                      </select>
+                    </div>
+                    <div className="w-px h-6 bg-white/10 mx-1" />
+
+                    <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px]" title="Font Size">
+                      <input
+                        type="number"
+                        className="w-10 bg-transparent text-white text-sm text-center outline-none selection:bg-blue-500/30"
+                        style={{ MozAppearance: 'textfield' }}
+                        value={Math.round((activeObject.fontSize || 40) * (activeObject.scaleY || 1))}
+                        onChange={(e) => {
+                          const val = parseInt(e.target.value);
+                          if (!val || val < 1) return;
+                          activeObject.set({ fontSize: val, scaleX: 1, scaleY: 1 });
+                          activeObject.setCoords();
+                          canvas.renderAll();
+                          setIsDirty(true);
+                          setRenderTick(t => t + 1);
+                        }}
+                      />
+                      <span className="text-white/50 text-xs font-semibold">pt</span>
+                    </div>
+                    <div className="w-px h-6 bg-white/10 mx-1" />
+
+                    {/* Text color — Canva-style, left of Bold */}
+                    <label
+                      className="relative flex flex-col items-center justify-center w-9 h-[34px] rounded-xl hover:bg-white/10 cursor-pointer shrink-0"
+                      title="Text color"
+                    >
+                      <span className="text-[13px] font-black leading-none text-white">A</span>
+                      <span
+                        className="mt-[3px] w-4 h-[3px] rounded-sm ring-1 ring-white/25"
+                        style={{ backgroundColor: normalizeColor(activeObject.fill) }}
+                      />
+                      <input
+                        type="color"
+                        value={normalizeColor(activeObject.fill)}
+                        onChange={(e) => applyFillColor(e.target.value)}
+                        className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0 border-0"
+                      />
+                    </label>
+
+                    <button onClick={() => { activeObject.set('fontWeight', activeObject.fontWeight === 'bold' ? 'normal' : 'bold'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.fontWeight === 'bold' ? 'bg-white text-ink' : 'hover:bg-white/10'}`}><Bold size={16} /></button>
+                    <button onClick={() => { activeObject.set('fontStyle', activeObject.fontStyle === 'italic' ? 'normal' : 'italic'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.fontStyle === 'italic' ? 'bg-white text-ink' : 'hover:bg-white/10'}`}><Italic size={16} /></button>
+
+                    <button onClick={() => { activeObject.set('uppercase', !activeObject.uppercase); activeObject.set('text', activeObject.uppercase ? activeObject.text.toLowerCase() : activeObject.text.toUpperCase()); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all text-xs font-bold leading-none ${activeObject.uppercase ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Uppercase">Aa</button>
+
+                    <div className="w-px h-6 bg-white/10 mx-1" />
+                    <button onClick={() => { activeObject.set('textAlign', 'left'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'left' || !activeObject.textAlign ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Left"><AlignLeft size={16} /></button>
+                    <button onClick={() => { activeObject.set('textAlign', 'center'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'center' ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Center"><AlignCenter size={16} /></button>
+                    <button onClick={() => { activeObject.set('textAlign', 'right'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'right' ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Right"><AlignRight size={16} /></button>
+                    <div className="w-px h-6 bg-white/10 mx-1" />
+
+                    {/* Letter Spacing */}
+                    <div className="flex items-center gap-1 bg-white/10 rounded-xl px-2 h-[34px]" title="Letter Spacing">
+                      <span className="text-[10px] text-white/50 font-bold uppercase tracking-widest hidden lg:block">LS</span>
+                      <input
+                        type="number"
+                        min="-200" max="1000" step="10"
+                        className="w-10 bg-transparent text-white text-xs text-center outline-none"
+                        value={activeObject.charSpacing || 0}
+                        onChange={(e) => {
+                          activeObject.set('charSpacing', parseInt(e.target.value) || 0);
+                          canvas.renderAll();
+                          setIsDirty(true);
+                          setRenderTick(t => t + 1);
+                        }}
+                      />
+                    </div>
+
+                    {/* Line Height */}
+                    <div className="flex items-center gap-1 bg-white/10 rounded-xl px-2 h-[34px]" title="Line Height">
+                      <span className="text-[10px] text-white/50 font-bold uppercase tracking-widest hidden lg:block">LH</span>
+                      <input
+                        type="number"
+                        min="0.5" max="3" step="0.1"
+                        className="w-10 bg-transparent text-white text-xs text-center outline-none"
+                        value={activeObject.lineHeight || 1.16}
+                        onChange={(e) => {
+                          activeObject.set('lineHeight', parseFloat(e.target.value) || 1.16);
+                          canvas.renderAll();
+                          setIsDirty(true);
+                          setRenderTick(t => t + 1);
+                        }}
+                      />
+                    </div>
+                    <div className="w-px h-6 bg-white/10 mx-1" />
+
+                    {/* Stroke Control */}
+                    <div className="flex items-center gap-1 bg-white/10 rounded-xl px-2 h-[34px]" title="Stroke">
+                      <span className="text-[9px] text-white/50 font-bold uppercase tracking-widest hidden xl:block">Stroke</span>
+                      <input
+                        type="color"
+                        value={normalizeColor(activeObject.stroke)}
+                        onChange={(e) => {
+                          activeObject.set('stroke', e.target.value);
+                          if (!activeObject.strokeWidth) activeObject.set('strokeWidth', 2);
+                          canvas.renderAll();
+                          setIsDirty(true);
+                          setRenderTick(t => t + 1);
+                        }}
+                        className="w-4 h-4 p-0 border-0 rounded cursor-pointer shrink-0"
+                        style={{ background: 'transparent' }}
+                      />
+                      <input
+                        type="number"
+                        min="0" max="20" step="1"
+                        className="w-8 ml-1 bg-transparent text-white text-xs text-center outline-none"
+                        value={activeObject.strokeWidth || 0}
+                        onChange={(e) => {
+                          if (parseInt(e.target.value) > 0 && !activeObject.stroke) {
+                            activeObject.set('stroke', '#000000');
+                          }
+                          activeObject.set('strokeWidth', parseInt(e.target.value) || 0);
+                          canvas.renderAll();
+                          setIsDirty(true);
+                          setRenderTick(t => t + 1);
+                        }}
+                      />
+                    </div>
+                    <div className="w-px h-6 bg-white/10 mx-1" />
+                  </>
+                )}
+
+                {/* Opacity Slider for all objects */}
+                <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px] group w-24 hover:w-32 transition-all overflow-hidden shrink-0" title="Opacity">
+                  <div className="text-[10px] text-white/70 font-bold uppercase leading-none mr-2">
+                    {Math.round((activeObject.opacity ?? 1) * 100)}%
+                  </div>
+                  <input
+                    type="range"
+                    min="0.1" max="1" step="0.05"
+                    className="w-16 accent-white"
+                    value={activeObject.opacity ?? 1}
+                    onChange={(e) => {
+                      activeObject.set('opacity', parseFloat(e.target.value));
+                      canvas.renderAll();
+                      setIsDirty(true);
+                      setRenderTick(t => t + 1);
+                    }}
+                  />
+                </div>
+                <div className="w-px h-6 bg-white/10 mx-1 shrink-0" />
+
+                <div className="flex gap-1 items-center bg-white/10 rounded-xl px-1 shrink-0">
+                  <button
+                    onClick={() => { canvas.bringToFront(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
+                    className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
+                    title="Bring to Front"
+                  ><Maximize size={16} className="rotate-45" /></button>
+                  <button
+                    onClick={() => { canvas.bringForward(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
+                    className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
+                    title="Bring Forward"
+                  ><ChevronUp size={16} /></button>
+                  <button
+                    onClick={() => { canvas.sendBackwards(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
+                    className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
+                    title="Send Backward"
+                  ><ChevronDown size={16} /></button>
+                  <button
+                    onClick={() => { canvas.sendToBack(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
+                    className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
+                    title="Send to Back"
+                  ><div className="w-3.5 h-3.5 border-2 border-white/40 rounded-sm" /></button>
+                </div>
+                <div className="w-px h-6 bg-white/10 mx-1 shrink-0" />
+
+                {/* Fill color for shapes / images (text uses the A color control) */}
+                {!String(activeObject?.type || '').toLowerCase().includes('text') && (
+                  <div className="flex items-center gap-2 px-2 group shrink-0" title="Fill color">
+                    <div
+                      className="w-5 h-5 rounded-full border border-white/20 shadow-inner relative"
+                      style={{ backgroundColor: normalizeColor(activeObject.fill) }}
+                    >
+                      <input
+                        type="color"
+                        value={normalizeColor(activeObject.fill)}
+                        onChange={(e) => applyFillColor(e.target.value)}
+                        className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                <div className="w-px h-6 bg-white/10 mx-1" />
+
+                {/* Layer Role Selector */}
+                <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px]" title="Layer Role (for Brand Kits)">
+                  <select
+                    className="bg-transparent text-white text-[10px] font-bold outline-none cursor-pointer w-20 uppercase"
+                    value={activeObject.role || 'none'}
+                    onChange={(e) => {
+                      activeObject.set('role', e.target.value);
+                      canvas.renderAll();
+                      setIsDirty(true);
+                      setRenderTick(t => t + 1);
+                    }}
+                  >
+                    <option value="none" className="text-black">None</option>
+                    <option value="brandName" className="text-black">Name</option>
+                    <option value="brandPhone" className="text-black">Phone</option>
+                    <option value="brandLogo" className="text-black">Logo</option>
+                    <option value="brandAddress" className="text-black">Address</option>
+                    <option value="brandEmail" className="text-black">Email</option>
+                  </select>
+                </div>
+
+                <div className="w-px h-6 bg-white/10 mx-1" />
+                <button onClick={deleteSelected} className="p-2 hover:bg-red-500 bg-red-500/10 text-red-500 hover:text-white rounded-xl transition-all duration-300"><Trash2 size={18} /></button>
+              </div>
+            )}
           </div>
 
-          {/* Contextual Controller - Production Ready */}
-          {activeObject && (
-            <div className="absolute top-6 left-1/2 -translate-x-1/2 flex items-center gap-1.5 bg-ink/90 backdrop-blur-xl text-white p-2 rounded-2xl shadow-2xl animate-in slide-in-from-top-4 duration-500 scale-90 sm:scale-100 overflow-x-auto max-w-[calc(100%-2rem)] touch-pan-x hide-scrollbar">
-              {activeObject?.type?.includes('text') && (
-                <>
-                  {/* Font Family Dropdown */}
-                  <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px]" title="Font Family">
-                    <select
-                      className="bg-transparent text-white text-xs outline-none cursor-pointer w-24"
-                      value={activeObject.fontFamily || 'Inter'}
-                      onChange={(e) => {
-                        activeObject.set('fontFamily', e.target.value);
-                        canvas.renderAll();
-                        setIsDirty(true);
-                        setRenderTick(t => t + 1);
-                      }}
-                    >
-                      <option value="Inter" className="text-black">Inter</option>
-                      <option value="Montserrat" className="text-black">Montserrat</option>
-                      <option value="Poppins" className="text-black">Poppins</option>
-                      <option value="Roboto" className="text-black">Roboto</option>
-                      <option value="Playfair Display" className="text-black">Playfair Display</option>
-                      <option value="Oswald" className="text-black">Oswald</option>
-                    </select>
-                  </div>
-                  <div className="w-px h-6 bg-white/10 mx-1" />
-
-                  <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px]" title="Font Size">
-                    <input
-                      type="number"
-                      className="w-10 bg-transparent text-white text-sm text-center outline-none selection:bg-blue-500/30"
-                      style={{ MozAppearance: 'textfield' }}
-                      value={Math.round((activeObject.fontSize || 40) * (activeObject.scaleY || 1))}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value);
-                        if (!val || val < 1) return;
-                        activeObject.set({ fontSize: val, scaleX: 1, scaleY: 1 });
-                        activeObject.setCoords();
-                        canvas.renderAll();
-                        setIsDirty(true);
-                        setRenderTick(t => t + 1);
-                      }}
-                    />
-                    <span className="text-white/50 text-xs font-semibold">pt</span>
-                  </div>
-                  <div className="w-px h-6 bg-white/10 mx-1" />
-
-                  {/* Text color — Canva-style, left of Bold */}
-                  <label
-                    className="relative flex flex-col items-center justify-center w-9 h-[34px] rounded-xl hover:bg-white/10 cursor-pointer shrink-0"
-                    title="Text color"
-                  >
-                    <span className="text-[13px] font-black leading-none text-white">A</span>
-                    <span
-                      className="mt-[3px] w-4 h-[3px] rounded-sm ring-1 ring-white/25"
-                      style={{ backgroundColor: normalizeColor(activeObject.fill) }}
-                    />
-                    <input
-                      type="color"
-                      value={normalizeColor(activeObject.fill)}
-                      onChange={(e) => applyFillColor(e.target.value)}
-                      className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0 border-0"
-                    />
-                  </label>
-
-                  <button onClick={() => { activeObject.set('fontWeight', activeObject.fontWeight === 'bold' ? 'normal' : 'bold'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.fontWeight === 'bold' ? 'bg-white text-ink' : 'hover:bg-white/10'}`}><Bold size={16} /></button>
-                  <button onClick={() => { activeObject.set('fontStyle', activeObject.fontStyle === 'italic' ? 'normal' : 'italic'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.fontStyle === 'italic' ? 'bg-white text-ink' : 'hover:bg-white/10'}`}><Italic size={16} /></button>
-
-                  <button onClick={() => { activeObject.set('uppercase', !activeObject.uppercase); activeObject.set('text', activeObject.uppercase ? activeObject.text.toLowerCase() : activeObject.text.toUpperCase()); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all text-xs font-bold leading-none ${activeObject.uppercase ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Uppercase">Aa</button>
-
-                  <div className="w-px h-6 bg-white/10 mx-1" />
-                  <button onClick={() => { activeObject.set('textAlign', 'left'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'left' || !activeObject.textAlign ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Left"><AlignLeft size={16} /></button>
-                  <button onClick={() => { activeObject.set('textAlign', 'center'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'center' ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Center"><AlignCenter size={16} /></button>
-                  <button onClick={() => { activeObject.set('textAlign', 'right'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'right' ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Right"><AlignRight size={16} /></button>
-                  <div className="w-px h-6 bg-white/10 mx-1" />
-
-                  {/* Letter Spacing */}
-                  <div className="flex items-center gap-1 bg-white/10 rounded-xl px-2 h-[34px]" title="Letter Spacing">
-                    <span className="text-[10px] text-white/50 font-bold uppercase tracking-widest hidden lg:block">LS</span>
-                    <input
-                      type="number"
-                      min="-200" max="1000" step="10"
-                      className="w-10 bg-transparent text-white text-xs text-center outline-none"
-                      value={activeObject.charSpacing || 0}
-                      onChange={(e) => {
-                        activeObject.set('charSpacing', parseInt(e.target.value) || 0);
-                        canvas.renderAll();
-                        setIsDirty(true);
-                        setRenderTick(t => t + 1);
-                      }}
-                    />
-                  </div>
-
-                  {/* Line Height */}
-                  <div className="flex items-center gap-1 bg-white/10 rounded-xl px-2 h-[34px]" title="Line Height">
-                    <span className="text-[10px] text-white/50 font-bold uppercase tracking-widest hidden lg:block">LH</span>
-                    <input
-                      type="number"
-                      min="0.5" max="3" step="0.1"
-                      className="w-10 bg-transparent text-white text-xs text-center outline-none"
-                      value={activeObject.lineHeight || 1.16}
-                      onChange={(e) => {
-                        activeObject.set('lineHeight', parseFloat(e.target.value) || 1.16);
-                        canvas.renderAll();
-                        setIsDirty(true);
-                        setRenderTick(t => t + 1);
-                      }}
-                    />
-                  </div>
-                  <div className="w-px h-6 bg-white/10 mx-1" />
-
-                  {/* Stroke Control */}
-                  <div className="flex items-center gap-1 bg-white/10 rounded-xl px-2 h-[34px]" title="Stroke">
-                    <span className="text-[9px] text-white/50 font-bold uppercase tracking-widest hidden xl:block">Stroke</span>
-                    <input
-                      type="color"
-                      value={normalizeColor(activeObject.stroke)}
-                      onChange={(e) => {
-                        activeObject.set('stroke', e.target.value);
-                        if (!activeObject.strokeWidth) activeObject.set('strokeWidth', 2);
-                        canvas.renderAll();
-                        setIsDirty(true);
-                        setRenderTick(t => t + 1);
-                      }}
-                      className="w-4 h-4 p-0 border-0 rounded cursor-pointer shrink-0"
-                      style={{ background: 'transparent' }}
-                    />
-                    <input
-                      type="number"
-                      min="0" max="20" step="1"
-                      className="w-8 ml-1 bg-transparent text-white text-xs text-center outline-none"
-                      value={activeObject.strokeWidth || 0}
-                      onChange={(e) => {
-                        if (parseInt(e.target.value) > 0 && !activeObject.stroke) {
-                          activeObject.set('stroke', '#000000');
-                        }
-                        activeObject.set('strokeWidth', parseInt(e.target.value) || 0);
-                        canvas.renderAll();
-                        setIsDirty(true);
-                        setRenderTick(t => t + 1);
-                      }}
-                    />
-                  </div>
-                  <div className="w-px h-6 bg-white/10 mx-1" />
-                </>
-              )}
-
-              {/* Opacity Slider for all objects */}
-              <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px] group w-24 hover:w-32 transition-all overflow-hidden shrink-0" title="Opacity">
-                <div className="text-[10px] text-white/70 font-bold uppercase leading-none mr-2">
-                  {Math.round((activeObject.opacity ?? 1) * 100)}%
-                </div>
-                <input
-                  type="range"
-                  min="0.1" max="1" step="0.05"
-                  className="w-16 accent-white"
-                  value={activeObject.opacity ?? 1}
-                  onChange={(e) => {
-                    activeObject.set('opacity', parseFloat(e.target.value));
-                    canvas.renderAll();
-                    setIsDirty(true);
-                    setRenderTick(t => t + 1);
-                  }}
-                />
-              </div>
-              <div className="w-px h-6 bg-white/10 mx-1 shrink-0" />
-
-              <div className="flex gap-1 items-center bg-white/10 rounded-xl px-1 shrink-0">
-                <button
-                  onClick={() => { canvas.bringToFront(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
-                  className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
-                  title="Bring to Front"
-                ><Maximize size={16} className="rotate-45" /></button>
-                <button
-                  onClick={() => { canvas.bringForward(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
-                  className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
-                  title="Bring Forward"
-                ><ChevronUp size={16} /></button>
-                <button
-                  onClick={() => { canvas.sendBackwards(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
-                  className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
-                  title="Send Backward"
-                ><ChevronDown size={16} /></button>
-                <button
-                  onClick={() => { canvas.sendToBack(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
-                  className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
-                  title="Send to Back"
-                ><div className="w-3.5 h-3.5 border-2 border-white/40 rounded-sm" /></button>
-              </div>
-              <div className="w-px h-6 bg-white/10 mx-1 shrink-0" />
-
-              {/* Fill color for shapes / images (text uses the A color control) */}
-              {!String(activeObject?.type || '').toLowerCase().includes('text') && (
-                <div className="flex items-center gap-2 px-2 group shrink-0" title="Fill color">
-                  <div
-                    className="w-5 h-5 rounded-full border border-white/20 shadow-inner relative"
-                    style={{ backgroundColor: normalizeColor(activeObject.fill) }}
-                  >
-                    <input
-                      type="color"
-                      value={normalizeColor(activeObject.fill)}
-                      onChange={(e) => applyFillColor(e.target.value)}
-                      className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0"
-                    />
-                  </div>
-                </div>
-              )}
-
-              <div className="w-px h-6 bg-white/10 mx-1" />
-              
-              {/* Layer Role Selector */}
-              <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px]" title="Layer Role (for Brand Kits)">
-                <select
-                  className="bg-transparent text-white text-[10px] font-bold outline-none cursor-pointer w-20 uppercase"
-                  value={activeObject.role || 'none'}
-                  onChange={(e) => {
-                    activeObject.set('role', e.target.value);
-                    canvas.renderAll();
-                    setIsDirty(true);
-                    setRenderTick(t => t + 1);
-                  }}
-                >
-                  <option value="none" className="text-black">None</option>
-                  <option value="brandName" className="text-black">Name</option>
-                  <option value="brandPhone" className="text-black">Phone</option>
-                  <option value="brandLogo" className="text-black">Logo</option>
-                  <option value="brandAddress" className="text-black">Address</option>
-                  <option value="brandEmail" className="text-black">Email</option>
-                </select>
-              </div>
-
-              <div className="w-px h-6 bg-white/10 mx-1" />
-              <button onClick={deleteSelected} className="p-2 hover:bg-red-500 bg-red-500/10 text-red-500 hover:text-white rounded-xl transition-all duration-300"><Trash2 size={18} /></button>
+          {/* Canvas stage — clear gap under the black tab */}
+          <div
+            id="canvas-viewport"
+            className="flex-1 min-h-0 relative flex items-center justify-center overflow-auto px-4 sm:px-10 pt-2 sm:pt-4 pb-24 lg:pb-10"
+          >
+            <div className="bg-white shadow-[0_40px_100px_rgba(0,0,0,0.15)] rounded-sm overflow-hidden flex items-center justify-center">
+              <canvas id="editor-canvas" />
             </div>
-          )}
 
-          {/* Quick Tools (Mobile Friendly Access) */}
-          <div className="lg:hidden absolute bottom-6 flex items-center gap-3 bg-white/95 backdrop-blur-md p-3 rounded-[2rem] shadow-2xl border border-brand-100">
-            <button type="button" onClick={() => addText('heading')} className="w-12 h-12 bg-ink text-white rounded-full flex items-center justify-center shadow-lg active:scale-90 transition-transform"><Type size={20} /></button>
-            <button type="button" onClick={() => setIsSidebarOpen(true)} className="w-12 h-12 bg-white text-ink rounded-full flex items-center justify-center shadow-lg border border-brand-100 active:scale-90 transition-transform"><Layers size={20} /></button>
-            <label className="w-12 h-12 bg-brand-500 text-white rounded-full flex items-center justify-center shadow-lg shadow-brand-500/40 cursor-pointer active:scale-90 transition-transform relative overflow-hidden">
-              <Upload size={20} />
-              <input type="file" className="absolute inset-0 opacity-0 cursor-pointer" onChange={handleFileUpload} accept="image/*" />
-            </label>
+            {/* Quick Tools (Mobile Friendly Access) */}
+            <div className="lg:hidden absolute bottom-6 left-1/2 -translate-x-1/2 flex items-center gap-3 bg-white/95 backdrop-blur-md p-3 rounded-[2rem] shadow-2xl border border-brand-100">
+              <button type="button" onClick={() => addText('heading')} className="w-12 h-12 bg-ink text-white rounded-full flex items-center justify-center shadow-lg active:scale-90 transition-transform"><Type size={20} /></button>
+              <button type="button" onClick={() => setIsSidebarOpen(true)} className="w-12 h-12 bg-white text-ink rounded-full flex items-center justify-center shadow-lg border border-brand-100 active:scale-90 transition-transform"><Layers size={20} /></button>
+              <label className="w-12 h-12 bg-brand-500 text-white rounded-full flex items-center justify-center shadow-lg shadow-brand-500/40 cursor-pointer active:scale-90 transition-transform relative overflow-hidden">
+                <Upload size={20} />
+                <input type="file" className="absolute inset-0 opacity-0 cursor-pointer" onChange={handleFileUpload} accept="image/*" />
+              </label>
+            </div>
           </div>
         </main>
       </div>

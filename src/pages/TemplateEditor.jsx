@@ -44,6 +44,20 @@ import { fetchCategoriesList } from '../services/categoriesApi';
 import { initAligningGuidelines } from '../utils/initAligningGuidelines';
 import { showError, getErrorMessage } from '../utils/toast';
 import { useConfirm } from '../context/ConfirmContext';
+import {
+  EDITOR_FONT_GROUPS,
+  EDITOR_FONTS,
+  ensureEditorFontLoaded,
+  fontForLanguage,
+  normalizeFontName,
+  preloadEditorFonts,
+} from '../utils/editorFonts';
+import {
+  TEXT_LANGUAGES,
+  convertTextLanguage,
+  detectTextLanguage,
+  isLatin,
+} from '../utils/transliterate';
 
 // Helper to normalize colors for <input type="color">
 const normalizeColor = (color) => {
@@ -67,6 +81,8 @@ const FABRIC_JSON_PROPS = [
   'selectable',
   'evented',
   'name',
+  'lang',
+  'latinSource',
 ];
 
 const SIZE_FROM_KEY = {
@@ -99,6 +115,229 @@ const parseFabricJSON = (raw) => {
   }
   if (typeof raw === 'object') return raw;
   return null;
+};
+
+const isBlobSrc = (src) => typeof src === 'string' && /^blob:/i.test(src.trim());
+
+const isPersistableSrc = (src) => {
+  if (!src || typeof src !== 'string') return false;
+  const trimmed = src.trim();
+  if (!trimmed || isBlobSrc(trimmed)) return false;
+  return /^(https?:|data:)/i.test(trimmed);
+};
+
+const getSerializedSrc = (node) => {
+  if (!node) return '';
+  if (typeof node === 'string') return node;
+  return node.src || node._originalElement?.src || '';
+};
+
+const isImageLike = (obj) => {
+  if (!obj || typeof obj !== 'object') return false;
+  if (typeof obj === 'string') return isBlobSrc(obj) || isPersistableSrc(obj);
+  const type = String(obj.type || '').toLowerCase();
+  return type.includes('image') || typeof obj.src === 'string';
+};
+
+const collectSalvageUrls = (template) => {
+  const urls = [];
+  const images = Array.isArray(template?.images) ? template.images : [];
+  for (const layer of images) {
+    const src = layer.image || layer.url;
+    if (isPersistableSrc(src) && !urls.includes(src)) urls.push(src);
+  }
+  return urls;
+};
+
+const IMAGE_RESTORE_KEYS = [
+  'id',
+  'role',
+  'name',
+  'left',
+  'top',
+  'scaleX',
+  'scaleY',
+  'angle',
+  'opacity',
+  'originX',
+  'originY',
+  'flipX',
+  'flipY',
+  'skewX',
+  'skewY',
+  'selectable',
+  'evented',
+  'visible',
+  'lockMovementX',
+  'lockMovementY',
+  'lockScalingX',
+  'lockScalingY',
+  'lockRotation',
+  'hasControls',
+  'cropX',
+  'cropY',
+  'width',
+  'height',
+];
+
+const dropOrReplaceTransientImages = (json, salvageUrls = []) => {
+  let salvageIndex = 0;
+  let skipped = 0;
+  let replaced = 0;
+
+  const walkArray = (arr) => {
+    if (!Array.isArray(arr)) return [];
+    return arr.map((item) => walkNode(item)).filter(Boolean);
+  };
+
+  const walkNode = (node) => {
+    if (!node || typeof node !== 'object') return node;
+    if (Array.isArray(node.objects)) {
+      node.objects = walkArray(node.objects);
+    }
+    if (!isImageLike(node)) return node;
+
+    const src = getSerializedSrc(node);
+    if (isPersistableSrc(src)) return node;
+    if (salvageIndex < salvageUrls.length) {
+      node.src = salvageUrls[salvageIndex++];
+      replaced += 1;
+      return node;
+    }
+    skipped += 1;
+    return null;
+  };
+
+  if (Array.isArray(json.objects)) {
+    json.objects = walkArray(json.objects);
+  }
+
+  if (json.backgroundImage) {
+    const src = getSerializedSrc(json.backgroundImage);
+    if (!isPersistableSrc(src)) {
+      if (salvageIndex < salvageUrls.length) {
+        if (typeof json.backgroundImage === 'string') {
+          json.backgroundImage = salvageUrls[salvageIndex++];
+        } else {
+          json.backgroundImage.src = salvageUrls[salvageIndex++];
+        }
+        replaced += 1;
+      } else {
+        delete json.backgroundImage;
+        skipped += 1;
+      }
+    }
+  }
+
+  return { skipped, replaced };
+};
+
+const loadFabricImage = async (src) => {
+  if (!isPersistableSrc(src)) return null;
+  try {
+    return await FabricImage.fromURL(src, { crossOrigin: 'anonymous' });
+  } catch {
+    try {
+      return await FabricImage.fromURL(src);
+    } catch (err) {
+      console.warn('Failed to load image', src, err);
+      return null;
+    }
+  }
+};
+
+const instantiateSerializedImage = async (data) => {
+  const src = typeof data === 'string' ? data : getSerializedSrc(data);
+  const img = await loadFabricImage(src);
+  if (!img) return null;
+  if (data && typeof data === 'object') {
+    const props = {};
+    for (const key of IMAGE_RESTORE_KEYS) {
+      if (data[key] !== undefined) props[key] = data[key];
+    }
+    img.set(props);
+    img.setCoords();
+  }
+  return img;
+};
+
+const canvasHasBlobImages = (canvasInstance) => {
+  if (!canvasInstance) return false;
+  const srcs = [];
+  canvasInstance.getObjects().forEach((obj) => {
+    const type = String(obj.type || '').toLowerCase();
+    if (type.includes('image')) {
+      srcs.push(obj.getSrc?.() || obj._element?.src || obj.src || '');
+    }
+  });
+  const bg = canvasInstance.backgroundImage;
+  if (bg) srcs.push(bg.getSrc?.() || bg.src || '');
+  return srcs.some((src) => isBlobSrc(src));
+};
+
+const payloadHasBlobSrcs = (data) => {
+  if (!data) return false;
+  const images = Array.isArray(data.images) ? data.images : [];
+  if (images.some((layer) => isBlobSrc(layer.image || layer.url))) return true;
+
+  const walk = (node) => {
+    if (!node) return false;
+    if (typeof node === 'string') return isBlobSrc(node);
+    if (typeof node !== 'object') return false;
+    if (typeof node.src === 'string' && isBlobSrc(node.src)) return true;
+    if (node.backgroundImage && walk(node.backgroundImage)) return true;
+    if (Array.isArray(node.objects) && node.objects.some(walk)) return true;
+    return false;
+  };
+
+  return walk(data.fabricJSON);
+};
+
+const loadFabricJSONSafely = async (canvasInstance, fabricJSON, options = {}) => {
+  const empty = { skipped: 0, replaced: 0 };
+  if (!canvasInstance || !fabricJSON) return empty;
+
+  const json = JSON.parse(JSON.stringify(fabricJSON));
+  const stats = dropOrReplaceTransientImages(json, options.salvageUrls || []);
+
+  const allObjects = Array.isArray(json.objects) ? json.objects : [];
+  const imageObjects = [];
+  const otherObjects = [];
+  for (const obj of allObjects) {
+    if (isImageLike(obj)) imageObjects.push(obj);
+    else otherObjects.push(obj);
+  }
+
+  const backgroundImage = json.backgroundImage;
+  const rest = { ...json, objects: otherObjects };
+  delete rest.backgroundImage;
+
+  try {
+    await canvasInstance.loadFromJSON(rest);
+  } catch (err) {
+    console.warn('Non-image JSON load failed, continuing with images', err);
+    try {
+      await canvasInstance.loadFromJSON({ ...rest, objects: [] });
+    } catch {
+      canvasInstance.clear();
+      canvasInstance.backgroundColor = rest.background || rest.backgroundColor || '#ffffff';
+    }
+  }
+
+  if (backgroundImage) {
+    const bgImg = await instantiateSerializedImage(backgroundImage);
+    if (bgImg) canvasInstance.backgroundImage = bgImg;
+    else stats.skipped += 1;
+  }
+
+  for (const objData of imageObjects) {
+    const img = await instantiateSerializedImage(objData);
+    if (img) canvasInstance.add(img);
+    else stats.skipped += 1;
+  }
+
+  canvasInstance.requestRenderAll();
+  return stats;
 };
 
 const resolveDesignSize = (template, fallback) => {
@@ -161,6 +400,8 @@ const TemplateEditor = () => {
   const [mediaLibrary, setMediaLibrary] = useState([]);
   const [isMediaLoading, setIsMediaLoading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
+  const [pendingUploads, setPendingUploads] = useState(0);
+  const [langBusy, setLangBusy] = useState(false);
   const [sizeOverride, setSizeOverride] = useState(null);
 
   // Layout & UI State
@@ -172,6 +413,8 @@ const TemplateEditor = () => {
   const redoStack = useRef([]);
   const clipboard = useRef(null);
   const isInternalChange = useRef(false);
+  const pendingUploadsRef = useRef(0);
+  const langBusyRef = useRef(false);
 
 
 
@@ -220,7 +463,14 @@ const TemplateEditor = () => {
     redoStack.current.push(currentState);
 
     const previousState = undoStack.current[undoStack.current.length - 1];
-    await canvas.loadFromJSON(JSON.parse(previousState));
+    try {
+      await loadFabricJSONSafely(canvas, JSON.parse(previousState));
+    } catch (err) {
+      console.error('Undo failed', err);
+      undoStack.current.push(currentState);
+      redoStack.current.pop();
+      showError('Could not undo that change');
+    }
     canvas.renderAll();
     isInternalChange.current = false;
     setRenderTick(t => t + 1);
@@ -233,7 +483,14 @@ const TemplateEditor = () => {
     const nextState = redoStack.current.pop();
     undoStack.current.push(nextState);
 
-    await canvas.loadFromJSON(JSON.parse(nextState));
+    try {
+      await loadFabricJSONSafely(canvas, JSON.parse(nextState));
+    } catch (err) {
+      console.error('Redo failed', err);
+      undoStack.current.pop();
+      redoStack.current.push(nextState);
+      showError('Could not redo that change');
+    }
     canvas.renderAll();
     isInternalChange.current = false;
     setRenderTick(t => t + 1);
@@ -300,6 +557,8 @@ const TemplateEditor = () => {
       fill: '#000000',
       originX: 'center',
       originY: 'center',
+      lang: 'en',
+      latinSource: content,
     });
 
     canvas.add(text);
@@ -391,6 +650,73 @@ const TemplateEditor = () => {
     },
     [canvas, activeObject]
   );
+
+  const refreshTextObject = useCallback((obj, canvasInstance = canvas) => {
+    if (!obj || !canvasInstance) return;
+    obj.dirty = true;
+    if (typeof obj.initDimensions === 'function') obj.initDimensions();
+    obj.setCoords();
+    canvasInstance.requestRenderAll();
+  }, [canvas]);
+
+  const applyCanvasFont = useCallback(async (obj, fontFamily, canvasInstance = canvas) => {
+    if (!obj || !fontFamily) return;
+    const name = await ensureEditorFontLoaded(fontFamily);
+    const meta = EDITOR_FONTS.find((font) => font.name === name);
+    const weights = meta?.weights || [400, 700];
+    const wantsBold = String(obj.fontWeight) === 'bold' || Number(obj.fontWeight) >= 600;
+    const nextWeight = wantsBold && weights.includes(700) ? 'bold' : 'normal';
+    obj.set({ fontFamily: name, fontWeight: nextWeight });
+    refreshTextObject(obj, canvasInstance);
+    setIsDirty(true);
+    setRenderTick((t) => t + 1);
+  }, [canvas, refreshTextObject]);
+
+  const applyTextLanguage = useCallback(async (targetLang) => {
+    if (!canvas || !activeObject) return;
+    const typeName = String(activeObject.type || '').toLowerCase();
+    if (!typeName.includes('text')) return;
+    if (langBusyRef.current) return;
+
+    const currentText = activeObject.text || '';
+    const currentLang = activeObject.lang || detectTextLanguage(currentText);
+    if (targetLang === currentLang && targetLang !== 'en' && !isLatin(currentText)) return;
+
+    setLangBusy(true);
+    langBusyRef.current = true;
+    try {
+      if (isLatin(currentText)) {
+        activeObject.set('latinSource', currentText);
+      } else if (!activeObject.latinSource && currentLang === 'en') {
+        activeObject.set('latinSource', currentText);
+      }
+
+      const nextText = await convertTextLanguage(
+        currentText,
+        targetLang,
+        activeObject.latinSource || ''
+      );
+
+      const nextFont = fontForLanguage(targetLang, activeObject.fontFamily);
+      await ensureEditorFontLoaded(nextFont);
+
+      activeObject.set({
+        text: nextText,
+        lang: targetLang,
+        fontFamily: nextFont,
+        uppercase: targetLang === 'en' ? activeObject.uppercase : false,
+      });
+      refreshTextObject(activeObject, canvas);
+      setIsDirty(true);
+      setRenderTick((t) => t + 1);
+    } catch (err) {
+      console.error('Language convert failed', err);
+      showError('Could not convert text language');
+    } finally {
+      langBusyRef.current = false;
+      setLangBusy(false);
+    }
+  }, [canvas, activeObject, refreshTextObject]);
 
   // Unsaved changes protection
   useEffect(() => {
@@ -525,6 +851,7 @@ const TemplateEditor = () => {
   };
 
   useEffect(() => {
+    preloadEditorFonts();
     const initCanvas = new Canvas('editor-canvas', {
       width: currentConfig.width,
       height: currentConfig.height,
@@ -568,6 +895,15 @@ const TemplateEditor = () => {
         setIsDirty(true);
       }
       syncLayers(initCanvas);
+    });
+
+    initCanvas.on('editing:exited', (e) => {
+      const obj = e.target;
+      if (!obj) return;
+      const typeName = String(obj.type || '').toLowerCase();
+      if (!typeName.includes('text')) return;
+      if (isLatin(obj.text)) obj.set('latinSource', obj.text);
+      if (!obj.lang) obj.set('lang', detectTextLanguage(obj.text));
     });
 
     initCanvas.on('object:modified', (e) => {
@@ -755,32 +1091,29 @@ const TemplateEditor = () => {
     const images = Array.isArray(template.images) ? template.images : [];
     for (const layer of images) {
       const src = layer.image || layer.url;
-      if (!src) continue;
-      try {
-        const img = await FabricImage.fromURL(src, { crossOrigin: 'anonymous' });
-        const targetW = (layer.width || 1) * design.width;
-        const targetH = (layer.height || 1) * design.height;
-        const scale = Math.min(
-          targetW / (img.width || 1),
-          targetH / (img.height || 1)
-        );
-        img.set({
-          id: generateId(),
-          role: layer.role || (layer.isBackground ? 'background' : 'none'),
-          originX: 'center',
-          originY: 'center',
-          left: (layer.x ?? 0.5) * design.width,
-          top: (layer.y ?? 0.5) * design.height,
-          scaleX: scale,
-          scaleY: scale,
-          angle: layer.angle || 0,
-          opacity: layer.opacity ?? 1,
-          name: layer.isBackground ? 'background' : undefined,
-        });
-        canvasInstance.add(img);
-      } catch (e) {
-        console.warn('Failed to restore image layer', e);
-      }
+      if (!isPersistableSrc(src)) continue;
+      const img = await loadFabricImage(src);
+      if (!img) continue;
+      const targetW = (layer.width || 1) * design.width;
+      const targetH = (layer.height || 1) * design.height;
+      const scale = Math.min(
+        targetW / (img.width || 1),
+        targetH / (img.height || 1)
+      );
+      img.set({
+        id: generateId(),
+        role: layer.role || (layer.isBackground ? 'background' : 'none'),
+        originX: 'center',
+        originY: 'center',
+        left: (layer.x ?? 0.5) * design.width,
+        top: (layer.y ?? 0.5) * design.height,
+        scaleX: scale,
+        scaleY: scale,
+        angle: layer.angle || 0,
+        opacity: layer.opacity ?? 1,
+        name: layer.isBackground ? 'background' : undefined,
+      });
+      canvasInstance.add(img);
     }
 
     const texts = [];
@@ -809,6 +1142,8 @@ const TemplateEditor = () => {
         stroke: t.strokeColor || undefined,
         strokeWidth: t.strokeWidth || 0,
         uppercase: !!t.uppercase,
+        lang: detectTextLanguage(t.text || ''),
+        latinSource: isLatin(t.text) ? t.text : '',
       });
       if (t.uppercase && text.text) text.set('text', String(text.text).toUpperCase());
       canvasInstance.add(text);
@@ -869,16 +1204,45 @@ const TemplateEditor = () => {
 
       const fabricJSON = parseFabricJSON(template.fabricJSON);
       const hasObjects = Array.isArray(fabricJSON?.objects) && fabricJSON.objects.length > 0;
+      let repaired = false;
 
       if (hasObjects || fabricJSON?.background || fabricJSON?.backgroundImage) {
-        await canvasInstance.loadFromJSON(fabricJSON);
+        try {
+          const stats = await loadFabricJSONSafely(canvasInstance, fabricJSON, {
+            salvageUrls: collectSalvageUrls(template),
+          });
+          if (stats.skipped > 0 || stats.replaced > 0) repaired = true;
+          if (stats.skipped > 0) {
+            showError('Some images could not be restored. Re-add them from the media library, then save.');
+          }
+        } catch (jsonErr) {
+          console.warn('Fabric JSON load failed, rebuilding from layers', jsonErr);
+          await rebuildCanvasFromLayers(canvasInstance, template, design);
+        }
       } else {
         await rebuildCanvasFromLayers(canvasInstance, template, design);
       }
 
-      canvasInstance.getObjects().forEach((obj) => {
+      if (
+        canvasInstance.getObjects().length === 0 &&
+        ((Array.isArray(template.images) && template.images.some((layer) => isPersistableSrc(layer.image || layer.url))) ||
+          template.title?.text ||
+          template.subtitle?.text ||
+          (Array.isArray(template.textLayers) && template.textLayers.length))
+      ) {
+        await rebuildCanvasFromLayers(canvasInstance, template, design);
+      }
+
+      for (const obj of canvasInstance.getObjects()) {
         if (!obj.id) obj.id = generateId();
-      });
+        const typeName = String(obj.type || '').toLowerCase();
+        if (!typeName.includes('text')) continue;
+        if (!obj.lang) obj.lang = detectTextLanguage(obj.text);
+        await ensureEditorFontLoaded(obj.fontFamily || 'Inter');
+        obj.dirty = true;
+        if (typeof obj.initDimensions === 'function') obj.initDimensions();
+        obj.setCoords();
+      }
 
       canvasInstance.requestRenderAll();
       syncLayers(canvasInstance);
@@ -892,7 +1256,7 @@ const TemplateEditor = () => {
         syncLayers(canvasInstance);
       }, 200);
 
-      setIsDirty(false);
+      setIsDirty(repaired);
     } catch (err) {
       console.error('Error loading template:', err);
       showError(getErrorMessage(err, 'Failed to load template'));
@@ -914,51 +1278,87 @@ const TemplateEditor = () => {
     }
 
     const localUrl = URL.createObjectURL(file);
-    let placedOnCanvas = false;
+    let img = null;
+    pendingUploadsRef.current += 1;
+    setPendingUploads(pendingUploadsRef.current);
 
     try {
       setLoading(true);
       setUploadProgress(1);
 
-      // 1) Show image on canvas immediately from local file (fixes blank CORS uploads)
-      const img = await placeImageOnCanvas(localUrl, canvas);
-      placedOnCanvas = true;
+      img = await placeImageOnCanvas(localUrl, canvas);
       if (window.innerWidth < 1024) setIsSidebarOpen(false);
 
-      // 2) Upload to backend and swap to permanent URL when available
       const uploaded = await uploadTemplateImage(file, (progressEvent) => {
         const progress = Math.round((progressEvent.loaded * 100) / (progressEvent.total || 1));
         setUploadProgress(progress);
       });
 
-      const imageUrl = uploaded?.url || uploaded?.imageUrl || uploaded?.data?.url;
+      const imageUrl =
+        uploaded?.url ||
+        uploaded?.imageUrl ||
+        uploaded?.data?.url ||
+        uploaded?.data?.imageUrl;
+
+      if (!imageUrl) {
+        throw new Error('Upload succeeded but no image URL was returned');
+      }
+
       let swappedToServer = false;
-      if (imageUrl && img) {
+      try {
+        await img.setSrc(imageUrl, { crossOrigin: 'anonymous' });
+        swappedToServer = true;
+      } catch {
         try {
-          await img.setSrc(imageUrl, { crossOrigin: 'anonymous' });
+          await img.setSrc(imageUrl);
           swappedToServer = true;
         } catch {
-          try {
-            await img.setSrc(imageUrl);
-            swappedToServer = true;
-          } catch (swapErr) {
-            console.warn('Kept local preview; could not swap to server URL', swapErr);
-          }
-        }
-        if (swappedToServer) {
-          img.setCoords();
-          canvas.requestRenderAll();
-          setIsDirty(true);
-          URL.revokeObjectURL(localUrl);
+          const props = {
+            left: img.left,
+            top: img.top,
+            scaleX: img.scaleX,
+            scaleY: img.scaleY,
+            angle: img.angle,
+            opacity: img.opacity,
+            originX: img.originX,
+            originY: img.originY,
+            id: img.id,
+            role: img.role,
+          };
+          canvas.remove(img);
+          const replacement = await placeImageOnCanvas(imageUrl, canvas);
+          if (!replacement) throw new Error('Could not attach uploaded image to the canvas');
+          replacement.set(props);
+          replacement.setCoords();
+          img = replacement;
+          swappedToServer = true;
         }
       }
 
+      if (!swappedToServer) {
+        throw new Error('Could not attach uploaded image to the canvas');
+      }
+
+      img.setCoords();
+      canvas.requestRenderAll();
+      setIsDirty(true);
+      undoStack.current = undoStack.current.map((state) => state.split(localUrl).join(imageUrl));
+      redoStack.current = redoStack.current.map((state) => state.split(localUrl).join(imageUrl));
+      URL.revokeObjectURL(localUrl);
       fetchMediaLibrary();
     } catch (err) {
       console.error('Upload failed:', err);
+      if (img) {
+        canvas.remove(img);
+        canvas.discardActiveObject();
+        canvas.requestRenderAll();
+        setActiveObject(null);
+      }
+      URL.revokeObjectURL(localUrl);
       showError(err?.response?.data?.message || err?.message || 'Upload failed');
-      if (!placedOnCanvas) URL.revokeObjectURL(localUrl);
     } finally {
+      pendingUploadsRef.current = Math.max(0, pendingUploadsRef.current - 1);
+      setPendingUploads(pendingUploadsRef.current);
       setIsMediaLoading(false);
       setLoading(false);
       setUploadProgress(0);
@@ -967,6 +1367,10 @@ const TemplateEditor = () => {
 
   const addFromLibrary = async (imageUrl) => {
     if (!canvas || !imageUrl) return;
+    if (!isPersistableSrc(imageUrl)) {
+      showError('This image cannot be added. Upload it again.');
+      return;
+    }
     try {
       setLoading(true);
       await placeImageOnCanvas(imageUrl, canvas);
@@ -1017,9 +1421,10 @@ const TemplateEditor = () => {
     const sizeMeta = SIZE_FROM_KEY[canvasType] || SIZE_FROM_KEY.post;
 
     const bgImage = canvas.backgroundImage;
-    if (bgImage) {
+    const bgSrc = bgImage?.getSrc?.() || bgImage?.src;
+    if (bgImage && isPersistableSrc(bgSrc)) {
       images.push({
-        image: bgImage.getSrc?.() || bgImage.src,
+        image: bgSrc,
         fit: 'cover',
         type: 'background',
         x: 0,
@@ -1058,8 +1463,10 @@ const TemplateEditor = () => {
       const isForcedBackground = obj.id === 'background' || obj.name === 'background';
 
       if (typeName.includes('image')) {
+        const imageSrc = obj.getSrc?.() || obj._element?.src || obj.src;
+        if (!isPersistableSrc(imageSrc)) return;
         images.push({
-          image: obj.getSrc?.() || obj._element?.src || obj.src,
+          image: imageSrc,
           fit: 'contain',
           type: isForcedBackground ? 'background' : 'image',
           x,
@@ -1118,6 +1525,7 @@ const TemplateEditor = () => {
     const fabricJSON = canvas.toJSON(FABRIC_JSON_PROPS);
     fabricJSON.width = baseWidth;
     fabricJSON.height = baseHeight;
+    dropOrReplaceTransientImages(fabricJSON);
 
     return {
       name: templateName || 'Untitled Template',
@@ -1142,8 +1550,22 @@ const TemplateEditor = () => {
   };
 
   const saveTemplate = async () => {
+    if (pendingUploadsRef.current > 0) {
+      showError('Wait for the image upload to finish before saving.');
+      return;
+    }
+    if (canvasHasBlobImages(canvas)) {
+      showError('Wait for the image upload to finish before saving.');
+      return;
+    }
+
     const data = normalizeTemplate();
     if (!data) return;
+
+    if (payloadHasBlobSrcs(data)) {
+      showError('Wait for the image upload to finish before saving.');
+      return;
+    }
 
     if (!data.name?.trim()) {
       showError('Template name is required');
@@ -1247,11 +1669,11 @@ const TemplateEditor = () => {
           <button
             type="button"
             onClick={saveTemplate}
-            disabled={loading}
+            disabled={loading || pendingUploads > 0}
             className="bg-brand-500 text-white px-5 py-2 rounded-xl text-xs sm:text-sm font-black hover:bg-brand-600 shadow-xl shadow-brand-500/20 transition-all flex items-center gap-2 disabled:opacity-50 active:scale-95"
           >
             <Save size={16} className="hidden sm:inline" />
-            {loading ? '...' : 'Save'}
+            {pendingUploads > 0 ? 'Uploading…' : loading ? '...' : 'Save'}
           </button>
 
           {/* Mobile Sidebar Toggle */}
@@ -1523,22 +1945,49 @@ const TemplateEditor = () => {
                     {/* Font Family Dropdown */}
                     <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px]" title="Font Family">
                       <select
-                        className="bg-transparent text-white text-xs outline-none cursor-pointer w-24"
-                        value={activeObject.fontFamily || 'Inter'}
+                        className="bg-transparent text-white text-xs outline-none cursor-pointer w-40"
+                        value={normalizeFontName(activeObject.fontFamily)}
                         onChange={(e) => {
-                          activeObject.set('fontFamily', e.target.value);
-                          canvas.renderAll();
-                          setIsDirty(true);
-                          setRenderTick(t => t + 1);
+                          applyCanvasFont(activeObject, e.target.value);
                         }}
                       >
-                        <option value="Inter" className="text-black">Inter</option>
-                        <option value="Montserrat" className="text-black">Montserrat</option>
-                        <option value="Poppins" className="text-black">Poppins</option>
-                        <option value="Roboto" className="text-black">Roboto</option>
-                        <option value="Playfair Display" className="text-black">Playfair Display</option>
-                        <option value="Oswald" className="text-black">Oswald</option>
+                        {EDITOR_FONT_GROUPS.map((group) => (
+                          <optgroup key={group.group} label={group.group} className="text-black">
+                            {group.fonts.map((font) => (
+                              <option key={font.name} value={font.name} className="text-black">
+                                {font.label}
+                              </option>
+                            ))}
+                          </optgroup>
+                        ))}
+                        {!EDITOR_FONTS.some((font) => font.name === normalizeFontName(activeObject.fontFamily)) && (
+                          <option value={normalizeFontName(activeObject.fontFamily)} className="text-black">
+                            {normalizeFontName(activeObject.fontFamily)}
+                          </option>
+                        )}
                       </select>
+                    </div>
+                    <div className="w-px h-6 bg-white/10 mx-1" />
+
+                    <div className="flex items-center bg-white/10 rounded-xl p-0.5 h-[34px] shrink-0" title="Text language">
+                      {TEXT_LANGUAGES.map((lang) => {
+                        const currentLang = activeObject.lang || detectTextLanguage(activeObject.text);
+                        const selected = currentLang === lang.id;
+                        return (
+                          <button
+                            key={lang.id}
+                            type="button"
+                            disabled={langBusy}
+                            title={lang.title}
+                            onClick={() => applyTextLanguage(lang.id)}
+                            className={`px-2 h-7 rounded-lg text-[10px] font-black transition-all disabled:opacity-50 ${
+                              selected ? 'bg-white text-ink' : 'text-white/80 hover:bg-white/10'
+                            }`}
+                          >
+                            {langBusy && selected ? '…' : lang.label}
+                          </button>
+                        );
+                      })}
                     </div>
                     <div className="w-px h-6 bg-white/10 mx-1" />
 

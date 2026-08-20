@@ -300,13 +300,15 @@ const loadFabricJSONSafely = async (canvasInstance, fabricJSON, options = {}) =>
   const json = JSON.parse(JSON.stringify(fabricJSON));
   const stats = dropOrReplaceTransientImages(json, options.salvageUrls || []);
 
+  // Preserve original stacking order. Images are restored separately (blob/CORS
+  // salvage), but must be re-inserted at their original indices — otherwise every
+  // image lands on top and text headings disappear under portraits/backgrounds.
   const allObjects = Array.isArray(json.objects) ? json.objects : [];
-  const imageObjects = [];
-  const otherObjects = [];
-  for (const obj of allObjects) {
-    if (isImageLike(obj)) imageObjects.push(obj);
-    else otherObjects.push(obj);
-  }
+  const slots = allObjects.map((obj) => ({
+    isImage: isImageLike(obj),
+    data: obj,
+  }));
+  const otherObjects = slots.filter((slot) => !slot.isImage).map((slot) => slot.data);
 
   const backgroundImage = json.backgroundImage;
   const rest = { ...json, objects: otherObjects };
@@ -330,10 +332,44 @@ const loadFabricJSONSafely = async (canvasInstance, fabricJSON, options = {}) =>
     else stats.skipped += 1;
   }
 
-  for (const objData of imageObjects) {
-    const img = await instantiateSerializedImage(objData);
-    if (img) canvasInstance.add(img);
-    else stats.skipped += 1;
+  const loadedOthers = canvasInstance.getObjects().slice();
+  let otherIndex = 0;
+  const orderedObjects = [];
+
+  for (const slot of slots) {
+    if (slot.isImage) {
+      const img = await instantiateSerializedImage(slot.data);
+      if (img) orderedObjects.push(img);
+      else stats.skipped += 1;
+    } else {
+      const obj = loadedOthers[otherIndex++];
+      if (obj) orderedObjects.push(obj);
+    }
+  }
+
+  // Re-apply bottom → top order so text that was saved above images stays above.
+  loadedOthers.forEach((obj) => {
+    if (obj.canvas === canvasInstance) canvasInstance.remove(obj);
+  });
+  orderedObjects.forEach((obj) => canvasInstance.add(obj));
+
+  // Templates saved after the old loader had every image appended on top of every
+  // text object. Detect that inverted stack and promote text back above images.
+  const stacked = canvasInstance.getObjects();
+  const textObjs = [];
+  let maxTextIdx = -1;
+  let minImageIdx = Infinity;
+  stacked.forEach((obj, index) => {
+    const typeName = String(obj.type || '').toLowerCase();
+    if (typeName.includes('text')) {
+      textObjs.push(obj);
+      maxTextIdx = Math.max(maxTextIdx, index);
+    } else if (typeName.includes('image')) {
+      minImageIdx = Math.min(minImageIdx, index);
+    }
+  });
+  if (textObjs.length && minImageIdx !== Infinity && maxTextIdx < minImageIdx) {
+    textObjs.forEach((obj) => canvasInstance.bringObjectToFront(obj));
   }
 
   canvasInstance.requestRenderAll();
@@ -562,7 +598,9 @@ const TemplateEditor = () => {
     });
 
     canvas.add(text);
+    canvas.bringObjectToFront(text);
     canvas.setActiveObject(text);
+    canvas.requestRenderAll();
     if (window.innerWidth < 1024) setIsSidebarOpen(false);
   }, [canvas, currentConfig]);
 
@@ -1033,12 +1071,12 @@ const TemplateEditor = () => {
       if (isMod && activeObj) {
         if (e.key === ']') {
           e.preventDefault();
-          if (e.shiftKey) canvas.bringToFront(activeObj); else canvas.bringForward(activeObj);
+          if (e.shiftKey) canvas.bringObjectToFront(activeObj); else canvas.bringObjectForward(activeObj);
           canvas.renderAll();
         }
         if (e.key === '[') {
           e.preventDefault();
-          if (e.shiftKey) canvas.sendToBack(activeObj); else canvas.sendBackwards(activeObj);
+          if (e.shiftKey) canvas.sendObjectToBack(activeObj); else canvas.sendObjectBackwards(activeObj);
           canvas.renderAll();
         }
       }
@@ -1089,65 +1127,73 @@ const TemplateEditor = () => {
     canvasInstance.backgroundColor = template.baseColor || '#ffffff';
 
     const images = Array.isArray(template.images) ? template.images : [];
-    for (const layer of images) {
-      const src = layer.image || layer.url;
-      if (!isPersistableSrc(src)) continue;
-      const img = await loadFabricImage(src);
-      if (!img) continue;
-      const targetW = (layer.width || 1) * design.width;
-      const targetH = (layer.height || 1) * design.height;
-      const scale = Math.min(
-        targetW / (img.width || 1),
-        targetH / (img.height || 1)
-      );
-      img.set({
-        id: generateId(),
-        role: layer.role || (layer.isBackground ? 'background' : 'none'),
-        originX: 'center',
-        originY: 'center',
-        left: (layer.x ?? 0.5) * design.width,
-        top: (layer.y ?? 0.5) * design.height,
-        scaleX: scale,
-        scaleY: scale,
-        angle: layer.angle || 0,
-        opacity: layer.opacity ?? 1,
-        name: layer.isBackground ? 'background' : undefined,
-      });
-      canvasInstance.add(img);
-    }
-
     const texts = [];
     if (template.title?.text) texts.push({ ...template.title, role: template.title.role || 'title' });
     if (template.subtitle?.text) texts.push({ ...template.subtitle, role: template.subtitle.role || 'subtitle' });
     if (Array.isArray(template.textLayers)) texts.push(...template.textLayers);
 
-    texts.forEach((t) => {
-      const text = new IText(t.text || '', {
-        id: generateId(),
-        role: t.role || 'none',
-        left: (t.x ?? 0.5) * design.width,
-        top: (t.y ?? 0.5) * design.height,
-        originX: 'center',
-        originY: 'center',
-        fontSize: t.size || 32,
-        fontFamily: t.font || 'Inter',
-        fill: t.color || '#000000',
-        fontWeight: t.bold ? 'bold' : 'normal',
-        fontStyle: t.italic ? 'italic' : 'normal',
-        textAlign: t.textAlign || t.alignment || 'center',
-        charSpacing: t.letterSpacing || 0,
-        lineHeight: t.lineHeight || 1.16,
-        angle: t.angle || 0,
-        opacity: t.opacity ?? 1,
-        stroke: t.strokeColor || undefined,
-        strokeWidth: t.strokeWidth || 0,
-        uppercase: !!t.uppercase,
-        lang: detectTextLanguage(t.text || ''),
-        latinSource: isLatin(t.text) ? t.text : '',
-      });
-      if (t.uppercase && text.text) text.set('text', String(text.text).toUpperCase());
-      canvasInstance.add(text);
-    });
+    // Build a single stack sorted by zIndex so text can sit above images.
+    const stack = [
+      ...images.map((layer) => ({ kind: 'image', layer, z: layer.zIndex ?? -1 })),
+      ...texts.map((layer) => ({ kind: 'text', layer, z: layer.zIndex ?? 999 })),
+    ].sort((a, b) => a.z - b.z);
+
+    for (const item of stack) {
+      if (item.kind === 'image') {
+        const layer = item.layer;
+        const src = layer.image || layer.url;
+        if (!isPersistableSrc(src)) continue;
+        const img = await loadFabricImage(src);
+        if (!img) continue;
+        const targetW = (layer.width || 1) * design.width;
+        const targetH = (layer.height || 1) * design.height;
+        const scale = Math.min(
+          targetW / (img.width || 1),
+          targetH / (img.height || 1)
+        );
+        img.set({
+          id: generateId(),
+          role: layer.role || (layer.isBackground ? 'background' : 'none'),
+          originX: 'center',
+          originY: 'center',
+          left: (layer.x ?? 0.5) * design.width,
+          top: (layer.y ?? 0.5) * design.height,
+          scaleX: scale,
+          scaleY: scale,
+          angle: layer.angle || 0,
+          opacity: layer.opacity ?? 1,
+          name: layer.isBackground ? 'background' : undefined,
+        });
+        canvasInstance.add(img);
+      } else {
+        const t = item.layer;
+        const text = new IText(t.text || '', {
+          id: generateId(),
+          role: t.role || 'none',
+          left: (t.x ?? 0.5) * design.width,
+          top: (t.y ?? 0.5) * design.height,
+          originX: 'center',
+          originY: 'center',
+          fontSize: t.size || 32,
+          fontFamily: t.font || 'Inter',
+          fill: t.color || '#000000',
+          fontWeight: t.bold ? 'bold' : 'normal',
+          fontStyle: t.italic ? 'italic' : 'normal',
+          textAlign: t.textAlign || t.alignment || 'center',
+          charSpacing: t.letterSpacing || 0,
+          lineHeight: t.lineHeight || 1.16,
+          angle: t.angle || 0,
+          opacity: t.opacity ?? 1,
+          stroke: t.strokeColor || undefined,
+          strokeWidth: t.strokeWidth || 0,
+          uppercase: !!t.uppercase,
+          lang: detectTextLanguage(t.text || ''),
+          latinSource: isLatin(t.text) ? t.text : '',
+        });
+        if (t.uppercase && text.text) text.set('text', String(text.text).toUpperCase());
+        canvasInstance.add(text);
+      }
+    }
   };
 
   const handleManualZoom = (newZoom) => {
@@ -2133,22 +2179,22 @@ const TemplateEditor = () => {
 
                 <div className="flex gap-1 items-center bg-white/10 rounded-xl px-1 shrink-0">
                   <button
-                    onClick={() => { canvas.bringToFront(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
+                    onClick={() => { canvas.bringObjectToFront(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); syncLayers(); }}
                     className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
                     title="Bring to Front"
                   ><Maximize size={16} className="rotate-45" /></button>
                   <button
-                    onClick={() => { canvas.bringForward(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
+                    onClick={() => { canvas.bringObjectForward(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); syncLayers(); }}
                     className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
                     title="Bring Forward"
                   ><ChevronUp size={16} /></button>
                   <button
-                    onClick={() => { canvas.sendBackwards(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
+                    onClick={() => { canvas.sendObjectBackwards(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); syncLayers(); }}
                     className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
                     title="Send Backward"
                   ><ChevronDown size={16} /></button>
                   <button
-                    onClick={() => { canvas.sendToBack(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }}
+                    onClick={() => { canvas.sendObjectToBack(activeObject); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); syncLayers(); }}
                     className="p-1.5 hover:bg-white/10 rounded-lg transition-colors"
                     title="Send to Back"
                   ><div className="w-3.5 h-3.5 border-2 border-white/40 rounded-sm" /></button>

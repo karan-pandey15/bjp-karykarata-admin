@@ -28,9 +28,17 @@ import {
   Lock,
   Unlock,
   Square,
+  Circle as CircleIcon,
+  Minus,
+  Triangle,
+  Star,
+  Pentagon,
+  Undo2,
+  Redo2,
+  ArrowUpRight,
   GripVertical
 } from 'lucide-react';
-import { Canvas, IText, FabricImage, Rect, Circle, Line } from 'fabric';
+import { Canvas, Textbox, FabricImage, Rect, Circle, Ellipse, Line, Triangle as FabricTriangle, Polygon, Path } from 'fabric';
 import { Reorder, useDragControls } from 'framer-motion';
 import {
   getTemplate,
@@ -115,6 +123,52 @@ const parseFabricJSON = (raw) => {
   }
   if (typeof raw === 'object') return raw;
   return null;
+};
+
+const isTextObject = (obj) => String(obj?.type || '').toLowerCase().includes('text');
+
+const createStarPoints = (spikes = 5, outerRadius = 80, innerRadius = 40) => {
+  const points = [];
+  let rot = -Math.PI / 2;
+  const step = Math.PI / spikes;
+  for (let i = 0; i < spikes; i += 1) {
+    points.push({
+      x: Math.cos(rot) * outerRadius,
+      y: Math.sin(rot) * outerRadius,
+    });
+    rot += step;
+    points.push({
+      x: Math.cos(rot) * innerRadius,
+      y: Math.sin(rot) * innerRadius,
+    });
+    rot += step;
+  }
+  return points;
+};
+
+const DEFAULT_SHAPE_FILL = 'transparent';
+const DEFAULT_SHAPE_STROKE = '#000000';
+const DEFAULT_SHAPE_STROKE_WIDTH = 3;
+
+const SHAPE_OUTLINE_PROPS = {
+  fill: DEFAULT_SHAPE_FILL,
+  stroke: DEFAULT_SHAPE_STROKE,
+  strokeWidth: DEFAULT_SHAPE_STROKE_WIDTH,
+  strokeUniform: true,
+};
+
+const isShapeObject = (obj) => {
+  const t = String(obj?.type || '').toLowerCase();
+  return (
+    t.includes('rect') ||
+    t.includes('circle') ||
+    t.includes('ellipse') ||
+    t.includes('triangle') ||
+    t.includes('polygon') ||
+    t.includes('polyline') ||
+    t.includes('path') ||
+    t === 'line'
+  );
 };
 
 const isBlobSrc = (src) => typeof src === 'string' && /^blob:/i.test(src.trim());
@@ -451,6 +505,10 @@ const TemplateEditor = () => {
   const isInternalChange = useRef(false);
   const pendingUploadsRef = useRef(0);
   const langBusyRef = useRef(false);
+  const historyBusyRef = useRef(false);
+  const syncLayersRef = useRef(() => {});
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const [historyBusy, setHistoryBusy] = useState(false);
 
 
 
@@ -488,49 +546,75 @@ const TemplateEditor = () => {
       // Limit history size
       if (undoStack.current.length > 50) undoStack.current.shift();
       redoStack.current = []; // Clear redo on new action
+      setHistoryVersion((v) => v + 1);
     }
   }, [canvas]);
 
   const undo = useCallback(async () => {
-    if (!canvas || undoStack.current.length <= 1) return;
+    if (!canvas || historyBusyRef.current || undoStack.current.length <= 1) return;
 
+    historyBusyRef.current = true;
+    setHistoryBusy(true);
     isInternalChange.current = true;
+
     const currentState = undoStack.current.pop();
     redoStack.current.push(currentState);
-
     const previousState = undoStack.current[undoStack.current.length - 1];
+
     try {
+      canvas.discardActiveObject();
       await loadFabricJSONSafely(canvas, JSON.parse(previousState));
+      canvas.requestRenderAll();
+      setHistoryVersion((v) => v + 1);
+      setActiveObject(null);
+      setIsDirty(true);
+      setRenderTick((t) => t + 1);
+      syncLayersRef.current?.(canvas);
     } catch (err) {
       console.error('Undo failed', err);
       undoStack.current.push(currentState);
       redoStack.current.pop();
       showError('Could not undo that change');
+    } finally {
+      isInternalChange.current = false;
+      historyBusyRef.current = false;
+      setHistoryBusy(false);
     }
-    canvas.renderAll();
-    isInternalChange.current = false;
-    setRenderTick(t => t + 1);
   }, [canvas]);
 
   const redo = useCallback(async () => {
-    if (!canvas || redoStack.current.length === 0) return;
+    if (!canvas || historyBusyRef.current || redoStack.current.length === 0) return;
 
+    historyBusyRef.current = true;
+    setHistoryBusy(true);
     isInternalChange.current = true;
+
     const nextState = redoStack.current.pop();
     undoStack.current.push(nextState);
 
     try {
+      canvas.discardActiveObject();
       await loadFabricJSONSafely(canvas, JSON.parse(nextState));
+      canvas.requestRenderAll();
+      setHistoryVersion((v) => v + 1);
+      setActiveObject(null);
+      setIsDirty(true);
+      setRenderTick((t) => t + 1);
+      syncLayersRef.current?.(canvas);
     } catch (err) {
       console.error('Redo failed', err);
       undoStack.current.pop();
       redoStack.current.push(nextState);
       showError('Could not redo that change');
+    } finally {
+      isInternalChange.current = false;
+      historyBusyRef.current = false;
+      setHistoryBusy(false);
     }
-    canvas.renderAll();
-    isInternalChange.current = false;
-    setRenderTick(t => t + 1);
   }, [canvas]);
+
+  const canUndo = !historyBusy && historyVersion >= 0 && undoStack.current.length > 1;
+  const canRedo = !historyBusy && historyVersion >= 0 && redoStack.current.length > 0;
 
   const copy = useCallback(async () => {
     if (!canvas || !activeObject) return;
@@ -571,17 +655,21 @@ const TemplateEditor = () => {
     let fontSize = 80;
     let fontWeight = 'bold';
     let content = 'HEADING';
+    let width = Math.min(720, currentConfig.width * 0.7);
 
     if (textType === 'subheading') {
       fontSize = 50;
       content = 'Subheading';
+      width = Math.min(640, currentConfig.width * 0.65);
     } else if (textType === 'body') {
       fontSize = 32;
       fontWeight = 'normal';
       content = 'Tap to edit text...';
+      width = Math.min(560, currentConfig.width * 0.6);
     }
 
-    const text = new IText(content, {
+    // Textbox (not IText) so textAlign left/center/right actually applies inside a fixed width
+    const text = new Textbox(content, {
       id: generateId(),
       role:
         textType === 'heading' ? 'title' : textType === 'subheading' ? 'subtitle' : 'none',
@@ -591,6 +679,8 @@ const TemplateEditor = () => {
       fontWeight: fontWeight,
       fontFamily: 'Inter',
       fill: '#000000',
+      width,
+      textAlign: 'center',
       originX: 'center',
       originY: 'center',
       lang: 'en',
@@ -604,51 +694,128 @@ const TemplateEditor = () => {
     if (window.innerWidth < 1024) setIsSidebarOpen(false);
   }, [canvas, currentConfig]);
 
+  const placeShapeOnCanvas = useCallback((shape) => {
+    if (!canvas || !shape) return;
+    canvas.add(shape);
+    canvas.setActiveObject(shape);
+    canvas.requestRenderAll();
+    setActiveObject(shape);
+    setIsDirty(true);
+    if (window.innerWidth < 1024) setIsSidebarOpen(false);
+  }, [canvas]);
+
   const addRect = useCallback(() => {
     if (!canvas) return;
-    const rect = new Rect({
+    placeShapeOnCanvas(new Rect({
       id: generateId(),
       left: currentConfig.width / 2,
       top: currentConfig.height / 2,
-      fill: '#CBD5E1',
-      width: 200,
-      height: 200,
+      width: 220,
+      height: 160,
       originX: 'center',
       originY: 'center',
-    });
-    canvas.add(rect);
-    canvas.setActiveObject(rect);
-  }, [canvas, currentConfig]);
+      ...SHAPE_OUTLINE_PROPS,
+    }));
+  }, [canvas, currentConfig, placeShapeOnCanvas]);
 
   const addCircle = useCallback(() => {
     if (!canvas) return;
-    const circle = new Circle({
+    placeShapeOnCanvas(new Circle({
       id: generateId(),
       left: currentConfig.width / 2,
       top: currentConfig.height / 2,
-      fill: '#CBD5E1',
       radius: 100,
       originX: 'center',
       originY: 'center',
-    });
-    canvas.add(circle);
-    canvas.setActiveObject(circle);
-  }, [canvas, currentConfig]);
+      ...SHAPE_OUTLINE_PROPS,
+    }));
+  }, [canvas, currentConfig, placeShapeOnCanvas]);
 
-  const addLine = useCallback(() => {
+  const addEllipse = useCallback(() => {
     if (!canvas) return;
-    const line = new Line([50, 50, 250, 50], {
+    placeShapeOnCanvas(new Ellipse({
       id: generateId(),
       left: currentConfig.width / 2,
       top: currentConfig.height / 2,
-      stroke: '#000000',
-      strokeWidth: 4,
+      rx: 120,
+      ry: 80,
       originX: 'center',
       originY: 'center',
+      ...SHAPE_OUTLINE_PROPS,
+    }));
+  }, [canvas, currentConfig, placeShapeOnCanvas]);
+
+  const addTriangle = useCallback(() => {
+    if (!canvas) return;
+    placeShapeOnCanvas(new FabricTriangle({
+      id: generateId(),
+      left: currentConfig.width / 2,
+      top: currentConfig.height / 2,
+      width: 200,
+      height: 180,
+      originX: 'center',
+      originY: 'center',
+      ...SHAPE_OUTLINE_PROPS,
+    }));
+  }, [canvas, currentConfig, placeShapeOnCanvas]);
+
+  const addStar = useCallback(() => {
+    if (!canvas) return;
+    placeShapeOnCanvas(new Polygon(createStarPoints(5, 90, 42), {
+      id: generateId(),
+      left: currentConfig.width / 2,
+      top: currentConfig.height / 2,
+      originX: 'center',
+      originY: 'center',
+      ...SHAPE_OUTLINE_PROPS,
+    }));
+  }, [canvas, currentConfig, placeShapeOnCanvas]);
+
+  const addPolygon = useCallback(() => {
+    if (!canvas) return;
+    const r = 95;
+    const sides = 6;
+    const points = Array.from({ length: sides }, (_, i) => {
+      const angle = (Math.PI * 2 * i) / sides - Math.PI / 2;
+      return { x: Math.cos(angle) * r, y: Math.sin(angle) * r };
     });
-    canvas.add(line);
-    canvas.setActiveObject(line);
-  }, [canvas, currentConfig]);
+    placeShapeOnCanvas(new Polygon(points, {
+      id: generateId(),
+      left: currentConfig.width / 2,
+      top: currentConfig.height / 2,
+      originX: 'center',
+      originY: 'center',
+      ...SHAPE_OUTLINE_PROPS,
+    }));
+  }, [canvas, currentConfig, placeShapeOnCanvas]);
+
+  const addLine = useCallback(() => {
+    if (!canvas) return;
+    placeShapeOnCanvas(new Line([0, 0, 240, 0], {
+      id: generateId(),
+      left: currentConfig.width / 2,
+      top: currentConfig.height / 2,
+      stroke: DEFAULT_SHAPE_STROKE,
+      strokeWidth: DEFAULT_SHAPE_STROKE_WIDTH,
+      fill: '',
+      originX: 'center',
+      originY: 'center',
+      strokeUniform: true,
+    }));
+  }, [canvas, currentConfig, placeShapeOnCanvas]);
+
+  const addArrow = useCallback(() => {
+    if (!canvas) return;
+    // Outline arrow — transparent inside, black border (Paint-style)
+    placeShapeOnCanvas(new Path('M 0 28 L 150 28 L 150 8 L 220 40 L 150 72 L 150 52 L 0 52 Z', {
+      id: generateId(),
+      left: currentConfig.width / 2,
+      top: currentConfig.height / 2,
+      originX: 'center',
+      originY: 'center',
+      ...SHAPE_OUTLINE_PROPS,
+    }));
+  }, [canvas, currentConfig, placeShapeOnCanvas]);
 
   const deleteSelected = useCallback(() => {
     if (!canvas || !activeObject) return;
@@ -658,11 +825,47 @@ const TemplateEditor = () => {
     setActiveObject(null);
   }, [canvas, activeObject]);
 
+  const applyTextAlign = useCallback((align) => {
+    if (!canvas || !activeObject || !isTextObject(activeObject)) return;
+    const obj = activeObject;
+    const typeName = String(obj.type || '').toLowerCase();
+
+    // Textbox needs a usable width for left/center/right to be visible
+    if (typeName.includes('textbox')) {
+      const minW = Math.max(obj.width || 0, Math.round((obj.fontSize || 32) * 8));
+      if ((obj.width || 0) < minW) obj.set('width', minW);
+    } else if ((obj.width || 0) < 200) {
+      // Legacy IText: give it a box so alignment shows for multi-line / wrapped content
+      obj.set('width', Math.max(240, Math.round((obj.fontSize || 32) * 10)));
+    }
+
+    obj.set('textAlign', align);
+    if (typeof obj.initDimensions === 'function') obj.initDimensions();
+    obj.setCoords();
+    canvas.requestRenderAll();
+    setIsDirty(true);
+    setRenderTick((t) => t + 1);
+    saveHistory(canvas);
+  }, [canvas, activeObject, saveHistory]);
+
+  const applyShapeScale = useCallback((factor) => {
+    if (!canvas || !activeObject || isTextObject(activeObject)) return;
+    const sx = Math.max(0.15, Math.min(4, (activeObject.scaleX || 1) * factor));
+    const sy = Math.max(0.15, Math.min(4, (activeObject.scaleY || 1) * factor));
+    activeObject.set({ scaleX: sx, scaleY: sy });
+    activeObject.setCoords();
+    canvas.requestRenderAll();
+    setIsDirty(true);
+    setRenderTick((t) => t + 1);
+    saveHistory(canvas);
+  }, [canvas, activeObject, saveHistory]);
+
   const applyFillColor = useCallback(
     (color) => {
       if (!canvas || !activeObject || !color) return;
       const obj = activeObject;
-      const isText = String(obj.type || '').toLowerCase().includes('text');
+      const typeName = String(obj.type || '').toLowerCase();
+      const isText = typeName.includes('text');
 
       if (isText && typeof obj.setSelectionStyles === 'function') {
         const start = obj.selectionStart ?? 0;
@@ -678,6 +881,14 @@ const TemplateEditor = () => {
         } catch {
           obj.set('fill', color);
         }
+      } else if (isShapeObject(obj)) {
+        // Paint-style shapes: color controls the border, keep fill transparent
+        obj.set({
+          stroke: color,
+          fill: 'transparent',
+          strokeWidth: Math.max(obj.strokeWidth || 0, DEFAULT_SHAPE_STROKE_WIDTH),
+          strokeUniform: true,
+        });
       } else {
         obj.set('fill', color);
       }
@@ -685,8 +896,26 @@ const TemplateEditor = () => {
       canvas.renderAll();
       setIsDirty(true);
       setRenderTick((t) => t + 1);
+      saveHistory(canvas);
     },
-    [canvas, activeObject]
+    [canvas, activeObject, saveHistory]
+  );
+
+  const applyShapeStrokeColor = useCallback(
+    (color) => {
+      if (!canvas || !activeObject || !color || !isShapeObject(activeObject)) return;
+      activeObject.set({
+        stroke: color,
+        fill: 'transparent',
+        strokeWidth: Math.max(activeObject.strokeWidth || 0, DEFAULT_SHAPE_STROKE_WIDTH),
+        strokeUniform: true,
+      });
+      canvas.renderAll();
+      setIsDirty(true);
+      setRenderTick((t) => t + 1);
+      saveHistory(canvas);
+    },
+    [canvas, activeObject, saveHistory]
   );
 
   const refreshTextObject = useCallback((obj, canvasInstance = canvas) => {
@@ -865,6 +1094,7 @@ const TemplateEditor = () => {
     });
     setLayers(mapped);
   }, [canvas]);
+  syncLayersRef.current = syncLayers;
 
   const handleReorder = (newLayers) => {
     // 1. Update React state ONLY for smooth UI animation
@@ -977,6 +1207,11 @@ const TemplateEditor = () => {
 
     if (id) {
       loadTemplate(id, initCanvas);
+    } else {
+      // Baseline history so the first add/delete can be undone (Canva-style)
+      undoStack.current = [JSON.stringify(initCanvas.toJSON(FABRIC_JSON_PROPS))];
+      redoStack.current = [];
+      setHistoryVersion((v) => v + 1);
     }
     fetchCategories();
     fetchMediaLibrary();
@@ -1013,12 +1248,12 @@ const TemplateEditor = () => {
       // Undo: Ctrl/Cmd + Z
       if (isMod && e.key === 'z' && !e.shiftKey) {
         e.preventDefault();
-        undo();
+        if (!historyBusyRef.current) undo();
       }
       // Redo: Ctrl/Cmd + Shift + Z or Ctrl/Cmd + Y
       if ((isMod && e.shiftKey && e.key === 'z') || (isMod && e.key === 'y')) {
         e.preventDefault();
-        redo();
+        if (!historyBusyRef.current) redo();
       }
       // Copy: Ctrl/Cmd + C
       if (isMod && e.key === 'c') {
@@ -1167,7 +1402,11 @@ const TemplateEditor = () => {
         canvasInstance.add(img);
       } else {
         const t = item.layer;
-        const text = new IText(t.text || '', {
+        const textWidth = Math.max(
+          120,
+          (t.width || 0.5) * design.width
+        );
+        const text = new Textbox(t.text || '', {
           id: generateId(),
           role: t.role || 'none',
           left: (t.x ?? 0.5) * design.width,
@@ -1180,6 +1419,7 @@ const TemplateEditor = () => {
           fontWeight: t.bold ? 'bold' : 'normal',
           fontStyle: t.italic ? 'italic' : 'normal',
           textAlign: t.textAlign || t.alignment || 'center',
+          width: textWidth,
           charSpacing: t.letterSpacing || 0,
           lineHeight: t.lineHeight || 1.16,
           angle: t.angle || 0,
@@ -1294,6 +1534,7 @@ const TemplateEditor = () => {
       syncLayers(canvasInstance);
       undoStack.current = [JSON.stringify(canvasInstance.toJSON(FABRIC_JSON_PROPS))];
       redoStack.current = [];
+      setHistoryVersion((v) => v + 1);
       isInternalChange.current = false;
 
       setTimeout(() => zoomToFit(canvasInstance, design), 50);
@@ -1705,6 +1946,28 @@ const TemplateEditor = () => {
         </div>
 
         <div className="flex items-center gap-2 sm:gap-4">
+          {/* Undo / Redo */}
+          <div className="flex items-center gap-1 bg-sand px-1.5 py-1 rounded-xl border border-brand-100">
+            <button
+              type="button"
+              onClick={undo}
+              disabled={!canUndo}
+              title="Undo (Ctrl+Z)"
+              className="p-1.5 text-stone-500 hover:text-ink disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+            >
+              <Undo2 size={16} />
+            </button>
+            <button
+              type="button"
+              onClick={redo}
+              disabled={!canRedo}
+              title="Redo (Ctrl+Shift+Z)"
+              className="p-1.5 text-stone-500 hover:text-ink disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+            >
+              <Redo2 size={16} />
+            </button>
+          </div>
+
           {/* Desktop Zoom */}
           <div className="hidden md:flex items-center gap-2 bg-sand px-3 py-1.5 rounded-xl border border-brand-100">
             <button type="button" onClick={() => handleManualZoom(zoomLevel - 0.1)} className="text-stone-400 hover:text-ink transition-colors"><ZoomOut size={16} /></button>
@@ -1869,6 +2132,35 @@ const TemplateEditor = () => {
                   </div>
                 </section>
 
+                {/* Shapes */}
+                <section className="space-y-4">
+                  <h3 className="text-[10px] font-black text-stone-400 uppercase tracking-[0.2em]">Shapes</h3>
+                  <p className="text-[10px] text-stone-400 -mt-2">Outline only (like Paint) — transparent inside, black border. Change border color from the top toolbar.</p>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { label: 'Rectangle', icon: Square, action: addRect },
+                      { label: 'Line', icon: Minus, action: addLine },
+                      { label: 'Arrow', icon: ArrowUpRight, action: addArrow },
+                      { label: 'Ellipse', icon: CircleIcon, action: addEllipse },
+                      { label: 'Polygon', icon: Pentagon, action: addPolygon },
+                      { label: 'Star', icon: Star, action: addStar },
+                      { label: 'Triangle', icon: Triangle, action: addTriangle },
+                      { label: 'Circle', icon: CircleIcon, action: addCircle },
+                    ].map((shape) => (
+                      <button
+                        key={shape.label}
+                        type="button"
+                        onClick={shape.action}
+                        title={shape.label}
+                        className="flex flex-col items-center justify-center gap-1.5 p-3 bg-sand border border-brand-100 rounded-2xl hover:bg-brand-50 hover:border-brand-300 transition-all text-stone-600"
+                      >
+                        <shape.icon size={18} strokeWidth={2} />
+                        <span className="text-[9px] font-bold uppercase tracking-wide">{shape.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </section>
+
                 {/* Project Config */}
                 <section className="space-y-4">
                   <h3 className="text-[10px] font-black text-stone-400 uppercase tracking-[0.2em]">Project Details</h3>
@@ -1978,15 +2270,37 @@ const TemplateEditor = () => {
 
         {/* Dynamic Canvas Viewport — toolbar docked above, never overlays template */}
         <main className="flex-1 min-h-0 flex flex-col overflow-hidden bg-[#e2e8f0]">
-          {/* Properties dock: reserved strip above the canvas */}
-          <div
-            className={`shrink-0 z-20 flex items-center justify-center px-3 sm:px-6 ${
-              activeObject ? 'pt-3 pb-3 min-h-[4rem]' : 'h-3'
-            }`}
-          >
-            {activeObject && (
-              <div className="flex items-center gap-1.5 bg-ink/90 backdrop-blur-xl text-white p-2 rounded-2xl shadow-2xl animate-in fade-in slide-in-from-top-2 duration-300 scale-90 sm:scale-100 overflow-x-auto max-w-[min(960px,calc(100%-1rem))] touch-pan-x hide-scrollbar border border-white/10">
-                {activeObject?.type?.includes('text') && (
+          {/* Properties dock: undo/redo always visible (Canva-style); object tools when selected */}
+          <div className="shrink-0 z-20 flex items-center justify-center px-3 sm:px-6 pt-3 pb-3 min-h-[4rem]">
+            <div className="flex items-center gap-1.5 bg-ink/90 backdrop-blur-xl text-white p-2 rounded-2xl shadow-2xl scale-90 sm:scale-100 overflow-x-auto max-w-[min(960px,calc(100%-1rem))] touch-pan-x hide-scrollbar border border-white/10">
+              {/* Undo / Redo — always available */}
+              <div className="flex items-center gap-0.5 bg-white/10 rounded-xl p-0.5 shrink-0">
+                <button
+                  type="button"
+                  onClick={undo}
+                  disabled={!canUndo}
+                  title="Undo (Ctrl+Z)"
+                  aria-label="Undo"
+                  className="p-2 rounded-lg transition-all hover:bg-white/15 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent active:scale-95"
+                >
+                  <Undo2 size={18} strokeWidth={2.25} />
+                </button>
+                <button
+                  type="button"
+                  onClick={redo}
+                  disabled={!canRedo}
+                  title="Redo (Ctrl+Shift+Z)"
+                  aria-label="Redo"
+                  className="p-2 rounded-lg transition-all hover:bg-white/15 disabled:opacity-30 disabled:cursor-not-allowed disabled:hover:bg-transparent active:scale-95"
+                >
+                  <Redo2 size={18} strokeWidth={2.25} />
+                </button>
+              </div>
+
+              {activeObject && (
+                <>
+                  <div className="w-px h-6 bg-white/10 mx-1 shrink-0" />
+                  {activeObject?.type?.includes('text') && (
                   <>
                     {/* Font Family Dropdown */}
                     <div className="flex items-center bg-white/10 rounded-xl px-2 h-[34px]" title="Font Family">
@@ -2081,9 +2395,9 @@ const TemplateEditor = () => {
                     <button onClick={() => { activeObject.set('uppercase', !activeObject.uppercase); activeObject.set('text', activeObject.uppercase ? activeObject.text.toLowerCase() : activeObject.text.toUpperCase()); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all text-xs font-bold leading-none ${activeObject.uppercase ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Uppercase">Aa</button>
 
                     <div className="w-px h-6 bg-white/10 mx-1" />
-                    <button onClick={() => { activeObject.set('textAlign', 'left'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'left' || !activeObject.textAlign ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Left"><AlignLeft size={16} /></button>
-                    <button onClick={() => { activeObject.set('textAlign', 'center'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'center' ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Center"><AlignCenter size={16} /></button>
-                    <button onClick={() => { activeObject.set('textAlign', 'right'); canvas.renderAll(); setIsDirty(true); setRenderTick(t => t + 1); }} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'right' ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Right"><AlignRight size={16} /></button>
+                    <button type="button" onClick={() => applyTextAlign('left')} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'left' || !activeObject.textAlign ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Left"><AlignLeft size={16} /></button>
+                    <button type="button" onClick={() => applyTextAlign('center')} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'center' ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Center"><AlignCenter size={16} /></button>
+                    <button type="button" onClick={() => applyTextAlign('right')} className={`p-2 rounded-xl transition-all ${activeObject.textAlign === 'right' ? 'bg-white text-ink' : 'hover:bg-white/10'}`} title="Align Right"><AlignRight size={16} /></button>
                     <div className="w-px h-6 bg-white/10 mx-1" />
 
                     {/* Letter Spacing */}
@@ -2201,21 +2515,62 @@ const TemplateEditor = () => {
                 </div>
                 <div className="w-px h-6 bg-white/10 mx-1 shrink-0" />
 
-                {/* Fill color for shapes / images (text uses the A color control) */}
+                {/* Shape resize + border color / image fill */}
                 {!String(activeObject?.type || '').toLowerCase().includes('text') && (
-                  <div className="flex items-center gap-2 px-2 group shrink-0" title="Fill color">
-                    <div
-                      className="w-5 h-5 rounded-full border border-white/20 shadow-inner relative"
-                      style={{ backgroundColor: normalizeColor(activeObject.fill) }}
-                    >
-                      <input
-                        type="color"
-                        value={normalizeColor(activeObject.fill)}
-                        onChange={(e) => applyFillColor(e.target.value)}
-                        className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0"
-                      />
-                    </div>
-                  </div>
+                  <>
+                    {isShapeObject(activeObject) && (
+                      <>
+                        <div className="flex items-center gap-1 bg-white/10 rounded-xl px-1 h-[34px] shrink-0" title="Resize shape">
+                          <button
+                            type="button"
+                            onClick={() => applyShapeScale(0.85)}
+                            className="px-2 h-7 rounded-lg text-[10px] font-black hover:bg-white/10"
+                            title="Make smaller"
+                          >
+                            S
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => applyShapeScale(1.15)}
+                            className="px-2 h-7 rounded-lg text-[10px] font-black hover:bg-white/10"
+                            title="Make larger"
+                          >
+                            L
+                          </button>
+                        </div>
+                        <div className="w-px h-6 bg-white/10 mx-1 shrink-0" />
+                        <div className="flex items-center gap-1.5 px-2 h-[34px] bg-white/10 rounded-xl shrink-0" title="Border color">
+                          <span className="text-[9px] font-bold text-white/60 uppercase hidden sm:inline">Border</span>
+                          <div
+                            className="w-5 h-5 rounded-full border border-white/30 shadow-inner relative"
+                            style={{ backgroundColor: normalizeColor(activeObject.stroke || DEFAULT_SHAPE_STROKE) }}
+                          >
+                            <input
+                              type="color"
+                              value={normalizeColor(activeObject.stroke || DEFAULT_SHAPE_STROKE)}
+                              onChange={(e) => applyShapeStrokeColor(e.target.value)}
+                              className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0"
+                            />
+                          </div>
+                        </div>
+                      </>
+                    )}
+                    {!isShapeObject(activeObject) && (
+                      <div className="flex items-center gap-2 px-2 group shrink-0" title="Fill color">
+                        <div
+                          className="w-5 h-5 rounded-full border border-white/20 shadow-inner relative"
+                          style={{ backgroundColor: normalizeColor(activeObject.fill) }}
+                        >
+                          <input
+                            type="color"
+                            value={normalizeColor(activeObject.fill)}
+                            onChange={(e) => applyFillColor(e.target.value)}
+                            className="absolute inset-0 opacity-0 cursor-pointer w-full h-full p-0"
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </>
                 )}
 
                 <div className="w-px h-6 bg-white/10 mx-1" />
@@ -2243,8 +2598,9 @@ const TemplateEditor = () => {
 
                 <div className="w-px h-6 bg-white/10 mx-1" />
                 <button onClick={deleteSelected} className="p-2 hover:bg-red-500 bg-red-500/10 text-red-500 hover:text-white rounded-xl transition-all duration-300"><Trash2 size={18} /></button>
-              </div>
-            )}
+                </>
+              )}
+            </div>
           </div>
 
           {/* Canvas stage — clear gap under the black tab */}
